@@ -149,7 +149,7 @@ function DailyPicker() {
 
         {tab === "today" && (
           <>
-            <button style={S.addBtn} onClick={() => createCustom(true)}>+ Add a one-off</button>
+<button style={{ ...S.addBtn, marginBottom: 16 }} onClick={() => createCustom(true)}>+ Add a one-off</button>
             <div style={S.controls}>
               <div style={S.ctlRow}><span style={S.ctlLabel}>Time</span>
                 {[30, 60, 120, 240].map((m) => <Chip key={m} on={mins === m} onClick={() => setMins(m)}>{m < 60 ? `${m}m` : `${m / 60}h`}</Chip>)}
