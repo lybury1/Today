@@ -35,6 +35,10 @@ git push -u origin main
 2. Share button → **Add to Home Screen** → Add.
 3. Open it from the icon. It runs full screen and works offline.
 
+## Updating the app after changes
+
+Upload the changed files over the old ones: repo page → **Add file → Upload files** → drag them in → Commit. Same-named files are replaced. Then open the app on the phone twice (once to fetch, once to run the new version).
+
 ## Editing tasks
 
 Open `tasks.js`. Each line is:

@@ -3,9 +3,9 @@ const { useState, useMemo, useEffect } = React;
 // ============ LIBRARY (see tasks.js) ============
 const RAW = window.TASK_LIBRARY;
 
-const CATS = Object.keys(RAW);
+const CATS = [...Object.keys(RAW), "One-off"];
 const LIB = [];
-CATS.forEach((cat) =>
+Object.keys(RAW).forEach((cat) =>
   RAW[cat].forEach(([name, cadence, opps, effort, energy]) =>
     LIB.push({ id: `${cat}:${name}`, name, cat, cadence, opps, effort, energy })
   )
@@ -28,7 +28,7 @@ const seedState = () => {
     const frac = ((i * 37) % 100) / 100;
     active[id] = { lastDone: today - Math.round(t.cadence * (0.4 + frac * 1.2)), history: [] };
   });
-  return { active, overrides: {}, custom: {}, points: 0, skipped: { day: today, ids: [] } };
+  return { active, overrides: {}, custom: {}, points: 0, skipped: { day: today, ids: [] }, hiddenLib: [] };
 };
 
 const urgencyWord = (u) => (u < 0.6 ? "fresh" : u < 1 ? "coming up" : u < 1.6 ? "ready" : u < 2.5 ? "been a while" : "long time");
@@ -55,6 +55,7 @@ function DailyPicker() {
   }, []);
 
   const { active, overrides, custom, points } = st;
+  const hiddenLib = st.hiddenLib || [];
   const skipped = st.skipped && st.skipped.day === day ? st.skipped.ids : [];
   const doneToday = Object.keys(active).filter((id) => (active[id].history || []).includes(day));
   const weekday = dateOf(day).getDay();
@@ -66,7 +67,7 @@ function DailyPicker() {
   };
   const allDefs = useMemo(() => [...LIB.map((t) => t.id), ...Object.keys(custom)].map(taskOf), [overrides, custom]);
   const activeTasks = useMemo(
-    () => Object.keys(active).map((id) => { const t = taskOf(id); return t && { ...t, u: (day - active[id].lastDone) / t.cadence }; }).filter(Boolean),
+    () => Object.keys(active).map((id) => { const t = taskOf(id); return t && { ...t, u: t.once ? 1 + (day - (active[id].added ?? active[id].lastDone)) / 7 : (day - active[id].lastDone) / t.cadence }; }).filter(Boolean),
     [active, overrides, custom, day]
   );
 
@@ -86,11 +87,15 @@ function DailyPicker() {
 
   // ---- actions ----
   const done = (t) => {
-    setSt((s) => ({
-      ...s,
-      active: { ...s.active, [t.id]: { lastDone: day, history: [...(s.active[t.id]?.history || []), day] } },
-      points: s.points + Math.max(5, Math.round(t.effort / 3)) + (t.u > 1.5 ? 5 : 0),
-    }));
+    setSt((s) => {
+      const pts = s.points + Math.max(5, Math.round(t.effort / 3)) + (t.u > 1.5 ? 5 : 0);
+      if (t.once) {
+        const a = { ...s.active }; delete a[t.id];
+        const c = { ...s.custom }; delete c[t.id];
+        return { ...s, active: a, custom: c, points: pts, doneOnce: [...(s.doneOnce || []), { name: t.name, day }].slice(-50) };
+      }
+      return { ...s, active: { ...s.active, [t.id]: { ...s.active[t.id], lastDone: day, history: [...(s.active[t.id]?.history || []), day] } }, points: pts };
+    });
   };
   const undo = (t) => {
     setSt((s) => {
@@ -102,15 +107,20 @@ function DailyPicker() {
   const add = (t) => setSt((s) => ({ ...s, active: { ...s.active, [t.id]: { lastDone: day - Math.round(t.cadence * 0.5), history: [] } } }));
   const remove = (t) => setSt((s) => { const a = { ...s.active }; delete a[t.id]; return { ...s, active: a }; });
   const edit = (id, patch) => setSt((s) => ({ ...s, overrides: { ...s.overrides, [id]: { ...(s.overrides[id] || {}), ...patch } } }));
-  const createCustom = () => {
+  const createCustom = (once) => {
     const id = `custom:${Date.now()}`;
     setSt((s) => ({
       ...s,
-      custom: { ...s.custom, [id]: { id, name: "New task", cat: "Admin", cadence: 7, opps: null, effort: 15, energy: 1 } },
-      active: { ...s.active, [id]: { lastDone: day - 3, history: [] } },
+      custom: { ...s.custom, [id]: once
+        ? { id, name: "", cat: "One-off", cadence: 7, opps: null, effort: 15, energy: 1, once: true }
+        : { id, name: "", cat: "Admin", cadence: 7, opps: null, effort: 15, energy: 1 } },
+      active: { ...s.active, [id]: { lastDone: day - 3, added: day, history: [] } },
     }));
     setOpen(id);
   };
+  const hideLib = (t) => setSt((s) => ({ ...s, hiddenLib: [...(s.hiddenLib || []), t.id] }));
+  const unhideLib = (t) => setSt((s) => ({ ...s, hiddenLib: (s.hiddenLib || []).filter((x) => x !== t.id) }));
+  const deleteCustom = (t) => setSt((s) => { const c = { ...s.custom }; delete c[t.id]; const a = { ...s.active }; delete a[t.id]; return { ...s, custom: c, active: a }; });
   const reset = () => { if (window.confirm("Reset everything to the starter set?")) setSt(seedState()); };
 
   const level = Math.floor(points / 100) + 1;
@@ -132,13 +142,14 @@ function DailyPicker() {
         </div>
 
         <div style={S.tabs}>
-          {[["today", "Today"], ["all", `Mine (${activeTasks.length})`], ["lib", `Library (${LIB.length})`]].map(([k, l]) => (
+          {[["today", "Today"], ["all", `Mine (${activeTasks.length})`], ["lib", `Library (${LIB.length - hiddenLib.length})`]].map(([k, l]) => (
             <button key={k} onClick={() => setTab(k)} style={{ ...S.tab, ...(tab === k ? S.tabOn : {}) }}>{l}</button>
           ))}
         </div>
 
         {tab === "today" && (
           <>
+            <button style={S.addBtn} onClick={() => createCustom(true)}>+ Add a one-off</button>
             <div style={S.controls}>
               <div style={S.ctlRow}><span style={S.ctlLabel}>Time</span>
                 {[30, 60, 120, 240].map((m) => <Chip key={m} on={mins === m} onClick={() => setMins(m)}>{m < 60 ? `${m}m` : `${m / 60}h`}</Chip>)}
@@ -179,9 +190,19 @@ function DailyPicker() {
 
         {tab === "all" && (
           <div>
-            <button style={S.addBtn} onClick={createCustom}>+ New task of your own</button>
-            {CATS.map((c) => {
-              const rows = activeTasks.filter((t) => t.cat === c).sort((a, b) => b.u - a.u);
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={S.addBtn} onClick={() => createCustom(false)}>+ Repeating task</button>
+              <button style={S.addBtn} onClick={() => createCustom(true)}>+ One-off</button>
+            </div>
+            {activeTasks.some((t) => t.once) && (<div><div style={S.sectionTitle}>One-offs</div>
+              {activeTasks.filter((t) => t.once).sort((a, b) => b.u - a.u).map((t) => (
+                <div key={t.id} style={S.allRow}><UrgencyDot u={t.u} />
+                  <div style={{ flex: 1, cursor: "pointer" }} onClick={() => setOpen(t.id)}><div>{t.name || "(untitled)"}</div>
+                    <div style={S.meta}>{t.effort} min{t.opps ? ` · ${t.opps.map((d) => DAYS[d]).join("/")}` : ""} · {urgencyWord(t.u)}</div></div>
+                </div>))}
+            </div>)}
+            {CATS.filter((c) => c !== "One-off").map((c) => {
+              const rows = activeTasks.filter((t) => t.cat === c && !t.once).sort((a, b) => b.u - a.u);
               if (!rows.length) return null;
               return (<div key={c}><div style={S.sectionTitle}>{c}</div>
                 {rows.map((t) => (
@@ -204,17 +225,25 @@ function DailyPicker() {
               {["All", ...CATS].map((c) => <Chip key={c} on={libCat === c} onClick={() => setLibCat(c)}>{c}</Chip>)}
             </div>
             {CATS.filter((c) => libCat === "All" || libCat === c).map((c) => {
-              const rows = allDefs.filter((t) => t.cat === c && !active[t.id] && t.name.toLowerCase().includes(libFilter.toLowerCase()));
+              const rows = allDefs.filter((t) => t.cat === c && !active[t.id] && !hiddenLib.includes(t.id) && !t.once && t.name.toLowerCase().includes(libFilter.toLowerCase()));
               if (!rows.length) return null;
               return (<div key={c}><div style={S.sectionTitle}>{c}</div>
                 {rows.map((t) => (
                   <div key={t.id} style={S.allRow}>
                     <div style={{ flex: 1, cursor: "pointer" }} onClick={() => setOpen(t.id)}><div>{t.name}</div>
                       <div style={S.meta}>every ~{t.cadence}d · {t.effort} min{t.opps ? ` · ${t.opps.map((d) => DAYS[d]).join("/")}` : ""}</div></div>
+                    <button style={S.linkBtn} onClick={() => hideLib(t)}>hide</button>
                     <button style={S.addBtnSm} onClick={() => add(t)}>Add</button>
                   </div>))}
               </div>);
             })}
+            {hiddenLib.length > 0 && (
+              <details style={S.details}><summary style={S.summary}>Hidden ({hiddenLib.length})</summary>
+                {hiddenLib.map((id) => { const t = taskOf(id); return t && (
+                  <div key={id} style={{ ...S.allRow, opacity: 0.6 }}><div style={{ flex: 1 }}>{t.name}<div style={S.meta}>{t.cat}</div></div>
+                    <button style={S.linkBtn} onClick={() => unhideLib(t)}>restore</button></div>); })}
+              </details>
+            )}
           </div>
         )}
       </div>
@@ -223,7 +252,7 @@ function DailyPicker() {
         <Detail t={openTask} rec={active[openTask.id]} day={day} isActive={!!active[openTask.id]}
           onClose={() => setOpen(null)} onEdit={(p) => edit(openTask.id, p)}
           onDone={() => done({ ...openTask, u: active[openTask.id] ? (day - active[openTask.id].lastDone) / openTask.cadence : 1 })}
-          onAdd={() => add(openTask)} onRemove={() => { remove(openTask); setOpen(null); }} doneToday={doneToday.includes(openTask.id)} />
+          onAdd={() => add(openTask)} onRemove={() => { (openTask.id.startsWith("custom:") ? deleteCustom : remove)(openTask); setOpen(null); }} doneToday={doneToday.includes(openTask.id)} />
       )}
     </div>
   );
@@ -241,14 +270,20 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
   return (
     <div style={S.sheetBg} onClick={onClose}>
       <div style={S.sheet} onClick={(e) => e.stopPropagation()}>
-        <input style={S.nameInput} value={t.name} onChange={(e) => onEdit({ name: e.target.value })} />
+        <input style={S.nameInput} value={t.name} placeholder="What is it?" autoFocus={!t.name} onChange={(e) => onEdit({ name: e.target.value })} />
 
-        <Field label="Category">
-          <select style={S.select} value={t.cat} onChange={(e) => onEdit({ cat: e.target.value })}>{CATS.map((c) => <option key={c}>{c}</option>)}</select>
+        <Field label="Repeats?">
+          <div style={{ display: "flex", gap: 4 }}>
+            <Chip on={!t.once} onClick={() => onEdit({ once: false, cat: t.cat === "One-off" ? "Admin" : t.cat })}>Repeats</Chip>
+            <Chip on={!!t.once} onClick={() => onEdit({ once: true, cat: "One-off" })}>Just once</Chip>
+          </div>
         </Field>
-        <Field label="Roughly every">
+        {!t.once && (<Field label="Category">
+          <select style={S.select} value={t.cat} onChange={(e) => onEdit({ cat: e.target.value })}>{CATS.filter((c) => c !== "One-off").map((c) => <option key={c}>{c}</option>)}</select>
+        </Field>)}
+        {!t.once && (<Field label="Roughly every">
           <input type="number" min="1" style={S.num} value={t.cadence} onChange={(e) => onEdit({ cadence: Math.max(1, +e.target.value || 1) })} /> <span style={S.meta}>days</span>
-        </Field>
+        </Field>)}
         <Field label="Can happen">
           <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             <Chip on={anyDay} onClick={() => onEdit({ opps: null })}>Any day</Chip>
@@ -268,7 +303,7 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
           <div style={{ display: "flex", gap: 4 }}>{[[1, "Low energy"], [2, "Some"], [3, "Real effort"]].map(([e, l]) => <Chip key={e} on={t.energy === e} onClick={() => onEdit({ energy: e })}>{l}</Chip>)}</div>
         </Field>
 
-        {isActive && (
+        {isActive && !t.once && (
           <div style={{ marginTop: 18 }}>
             <div style={S.sectionTitle}>Last 4 weeks</div>
             <div style={S.grid}>
@@ -298,8 +333,8 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
         <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
           {isActive ? (
             <>
-              <button style={S.doneBtn} onClick={onDone} disabled={doneToday}>{doneToday ? "Done today" : "Mark done today"}</button>
-              <button style={S.linkBtn} onClick={onRemove}>stop tracking</button>
+              <button style={S.doneBtn} onClick={() => { onDone(); if (t.once) onClose(); }} disabled={doneToday}>{doneToday ? "Done today" : t.once ? "Done" : "Mark done today"}</button>
+              <button style={S.linkBtn} onClick={onRemove}>{t.once ? "delete" : "stop tracking"}</button>
             </>
           ) : (
             <button style={S.doneBtn} onClick={() => { onAdd(); onClose(); }}>Start tracking</button>
@@ -329,7 +364,7 @@ function TaskRow({ t, onOpen, onDone, onSkip, muted }) {
     <div style={{ ...S.row, opacity: muted ? 0.75 : 1 }}>
       <UrgencyDot u={t.u} />
       <div style={{ flex: 1, cursor: "pointer" }} onClick={onOpen}>
-        <div>{t.name}</div><div style={S.meta}>{t.cat} · {t.effort} min · {urgencyWord(t.u)}</div>
+        <div>{t.name || "(untitled)"}</div><div style={S.meta}>{t.cat} · {t.effort} min · {urgencyWord(t.u)}</div>
       </div>
       <button style={S.linkBtn} onClick={onSkip}>not today</button>
       <button style={S.doneBtn} onClick={onDone}>Done</button>
