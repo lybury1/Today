@@ -39,6 +39,27 @@ git push -u origin main
 
 Upload the changed files over the old ones: repo page → **Add file → Upload files** → drag them in → Commit. Same-named files are replaced. Then open the app on the phone twice (once to fetch, once to run the new version).
 
+## Sync between devices (GitHub Gist)
+
+The ⚙ tab can keep your data in a private gist on your GitHub account, so Safari, the home-screen app and your Mac all see the same thing.
+
+Make a token (once):
+
+1. GitHub → your avatar → **Settings** → **Developer settings** (bottom of the left menu) → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**
+2. Name: `Today app`. Expiration: 1 year (you'll paste a new one when it expires)
+3. Repository access: **Public repositories (read-only)** is fine — it isn't used
+4. **Account permissions** → **Gists** → *Read and write*. Nothing else
+5. Generate, copy the token (it starts `github_pat_`)
+6. In the app: ⚙ → paste → **Connect**
+
+It finds or creates a private gist called "Today app data" and saves a couple of seconds after each change. On a second device, paste the same token and it picks up the same gist.
+
+The token is stored only in the app on that device. It can read and write your gists and nothing else.
+
+## Backup
+
+⚙ → **Export file** downloads a JSON of everything (iPhone: save to Files / iCloud). **Import file** restores from one.
+
 ## Editing tasks
 
 Open `tasks.js`. Each line is:
