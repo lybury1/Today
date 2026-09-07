@@ -1,0 +1,14 @@
+{
+  "name": "Today",
+  "short_name": "Today",
+  "description": "What's worth doing today — no overdue, no guilt.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#E6ECE4",
+  "theme_color": "#E6ECE4",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
