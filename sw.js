@@ -1,5 +1,5 @@
 // Simple offline cache. Bump CACHE name whenever you change files.
-const CACHE = "today-v4";
+const CACHE = "today-v5";
 const FILES = [
   "./", "./index.html", "./app.jsx", "./tasks.js", "./manifest.json", "./icon-192.png", "./icon-512.png",
   "https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js",

@@ -16,9 +16,10 @@ Every task has a rough **cadence** (days) and the **days it can happen** (`opps`
 - `README.md` — user-facing setup notes.
 
 ## State
-- Saved in `localStorage` under `today-app-v1`. Shape: `{ active: {id: {lastDone, history[], added?}}, overrides: {id: partial task}, custom: {id: task}, points, skipped: {day, ids}, hiddenLib[], hiddenCats[], customCats[], doneOnce[], updatedAt }`.
+- Saved in `localStorage` under `today-app-v1`. Shape: `{ active: {id: {lastDone, history[], added?}}, overrides: {id: partial task}, custom: {id: task}, points, skipped: {day, ids}, snoozed: {id: untilDay}, pinned: {day, ids}, holiday: {since} | null, removed: {id: day}, hiddenLib[], hiddenCats[], customCats[], doneOnce[], updatedAt }`.
+- `snoozed` = "not this week" (hidden until `untilDay`, next Monday). `pinned` = day-scoped "do today" (bypasses the time/energy filters, sits at the top of picks). `holiday` freezes urgency (u is computed against `min(day, holiday.since)`); ending it shifts every `lastDone`/`added` forward by the gap so nothing piles up. `removed` holds tombstones so sync-merge can tell "removed here" from "added there".
 - Days are integers since 1 Jan 2026 (`todayIndex()` / `dateOf(day)`).
-- Optional sync to a private GitHub Gist (`today.json`); token + gistId in `localStorage` `today-app-sync`. Last-write-wins on `updatedAt`. Every state change must go through `setStamped` so `updatedAt` updates.
+- Optional sync to a private GitHub Gist (`today.json`); token + gistId in `localStorage` `today-app-sync`. On pull, local and remote are **merged** (`mergeStates`): histories unioned, `lastDone` max, points max, tombstone-aware; simple fields favour the newer state. Every state change must go through `setStamped` so `updatedAt` updates.
 - Never break backwards compatibility of the saved state without a migration — Henry has real history in there.
 
 ## Style
@@ -41,5 +42,9 @@ node -e 'global.window={};eval(require("fs").readFileSync("tasks.js","utf8"));co
 
 ## Backlog / ideas Henry has mentioned
 - "Surprise me with 5 untracked tasks" in the Library
-- Richer tracking (weekly view, per-category totals)
+- Shuffle / re-deal the suggested list
+- Search on the Mine tab; bulk-add from the Library
+- Variety guard (max ~3 picks per category); notes field per task; dark mode
 - Push notifications / native wrap via Capacitor later, if the PWA sticks
+
+Done in v4 (Sep 2026): "not this week" snooze, pin-to-today, one-offs start at u=1.2, Week tab (weekly recap), merge-based gist sync, category view toggle on Today, holiday mode.
