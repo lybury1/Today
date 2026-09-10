@@ -8,11 +8,16 @@ Every task has a rough **cadence** (days) and the **days it can happen** (`opps`
 **Nothing is ever "overdue"** — there is no red badge, no streak, no guilt. A skipped task just comes back a bit higher next time it's possible. Do not add due dates, overdue counts or streak-break mechanics. One-off tasks (`once: true`) start at "ready", climb gently, and vanish when done.
 
 ## Files
-- `index.html` — shell. React 18 + Babel standalone from cdnjs. No build step; `app.jsx` is transpiled in the browser.
-- `app.jsx` — the whole app, one component (`DailyPicker`) plus `Detail` sheet and small bits. Inline styles in the `S` object at the bottom.
-- `tasks.js` — the task library, `window.TASK_LIBRARY = { Category: [[name, cadence, opps, effort_mins, energy_1to3], …] }` and `window.STARTER_TASKS`. ~800 tasks. **Task id = `Category:Name`**, so renaming a task or moving it between categories resets its history for the user — avoid unless asked.
-- `sw.js` — offline cache. **Bump `CACHE` (today-vN → today-vN+1) on every change to any file**, or users get the stale version.
-- `manifest.json`, `icon-*.png` — PWA install.
+Vite build (Node lives at `~/.local/node/bin`, on PATH via `.zshrc`). `npm run dev` / `npm run build`.
+- `index.html` — Vite entry. Loads `public/tasks.js` as a plain script (deliberately unbundled so it stays hand-editable), then `src/main.jsx`.
+- `src/app.jsx` — the whole app, one component (`DailyPicker`) plus `Detail` sheet and small bits. Inline styles in the `S` object at the bottom.
+- `src/main.jsx` — loads saved state async (so no starter-set flash), then renders.
+- `src/storage.js` — ALL persistence goes through here: localStorage on web, Capacitor Preferences on native.
+- `src/notify.js` — daily-reminder local notifications; no-op on web (`canNotify` gates the settings UI).
+- `public/tasks.js` — the task library, `window.TASK_LIBRARY = { Category: [[name, cadence, opps, effort_mins, energy_1to3], …] }` and `window.STARTER_TASKS`. ~800 tasks. **Task id = `Category:Name`**, so renaming a task or moving it between categories resets its history for the user — avoid unless asked.
+- `public/sw.js` — offline cache, runtime (network-first) since bundle names are hashed. Bump `CACHE` to force a clean slate.
+- `public/manifest.json`, `public/icon-*.png` — PWA install.
+- `ios/` — Capacitor iOS shell (SPM, no CocoaPods). `npx cap sync ios` after every web build. App id `com.lybury1.today`. Needs full Xcode to build/run.
 - `README.md` — user-facing setup notes.
 
 ## State
@@ -38,7 +43,7 @@ node -e 'global.window={};eval(require("fs").readFileSync("tasks.js","utf8"));co
 ```
 
 ## Deploying
-`git add -A && git commit -m "…" && git push` — Pages redeploys in ~1–3 min, then a 10-min edge cache. Henry opens the app twice on the phone to pick up a new service-worker version.
+`git add -A && git commit -m "…" && git push` — the GitHub Actions workflow (`.github/workflows/deploy.yml`) builds and deploys Pages on every push to main (Pages source must be "GitHub Actions"). ~10-min edge cache after deploy. Henry opens the app twice on the phone to pick up a new service-worker version. Henry pushes via GitHub Desktop; command-line git has no push credentials on this Mac.
 
 ## Backlog / ideas Henry has mentioned
 - "Surprise me with 5 untracked tasks" in the Library

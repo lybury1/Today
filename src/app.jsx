@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { saveState, saveSync, clearSync } from "./storage.js";
+import { canNotify, setDailyReminder } from "./notify.js";
 
 // ============ LIBRARY (see tasks.js) ============
 const RAW = window.TASK_LIBRARY;
@@ -238,6 +239,7 @@ export default function DailyPicker({ initial, initialSync }) {
   const unsnooze = (id) => setStamped((s) => { const sn = { ...(s.snoozed || {}) }; delete sn[id]; return { ...s, snoozed: sn }; });
   const pin = (t) => setStamped((s) => { const ids = s.pinned?.day === day ? s.pinned.ids : [];
     return { ...s, pinned: { day, ids: ids.includes(t.id) ? ids.filter((x) => x !== t.id) : [...ids, t.id] } }; });
+  const setReminderTo = async (h) => { const ok = await setDailyReminder(h); if (ok) setStamped((s) => ({ ...s, reminder: h })); };
   const startHoliday = () => setStamped((s) => ({ ...s, holiday: { since: day } }));
   const endHoliday = () => setStamped((s) => {
     const gap = day - s.holiday.since; const a = {};
@@ -504,6 +506,17 @@ export default function DailyPicker({ initial, initialSync }) {
 
             <div style={S.sectionTitle}>Stats</div>
             <div style={S.statRow}><Stat n={activeTasks.length} l="tracking" /><Stat n={Object.values(active).reduce((a, r) => a + (r.history || []).length, 0)} l="things done" /><Stat n={(st.doneOnce || []).length} l="one-offs done" /><Stat n={points} l="points" /></div>
+
+            {canNotify && (
+              <>
+                <div style={S.sectionTitle}>Daily reminder</div>
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  <Chip on={st.reminder == null} onClick={() => setReminderTo(null)}>Off</Chip>
+                  {[8, 13, 18].map((h) => <Chip key={h} on={st.reminder === h} onClick={() => setReminderTo(h)}>{h}:00</Chip>)}
+                </div>
+                <div style={S.footnote}>One gentle nudge a day, nothing else. No badges, no nagging.</div>
+              </>
+            )}
 
             <div style={S.sectionTitle}>Going away?</div>
             {holiday ? (
