@@ -1,4 +1,5 @@
-const { useState, useMemo, useEffect } = React;
+import React, { useState, useMemo, useEffect } from "react";
+import { saveState, saveSync, clearSync } from "./storage.js";
 
 // ============ LIBRARY (see tasks.js) ============
 const RAW = window.TASK_LIBRARY;
@@ -61,15 +62,13 @@ const mergeStates = (a, b) => {
     .sort((x, y) => x.day - y.day).slice(-50);
   return { ...older, ...newer, active, custom, removed, overrides: { ...(older.overrides || {}), ...(newer.overrides || {}) }, points: Math.max(a.points || 0, b.points || 0), doneOnce };
 };
-const STORAGE_KEY = "today-app-v1";
-const SYNC_KEY = "today-app-sync";
 
 // ============ APP ============
-function DailyPicker() {
-  const [st, setSt] = useState(() => { try { const s = localStorage.getItem(STORAGE_KEY); if (s) return JSON.parse(s); } catch (e) {} return seedState(); });
+export default function DailyPicker({ initial, initialSync }) {
+  const [st, setSt] = useState(() => initial || seedState());
   const [day, setDay] = useState(todayIndex);
   const [newCat, setNewCat] = useState("");
-  const [sync, setSync] = useState(() => { try { return JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; } catch (e) { return {}; } });
+  const [sync, setSync] = useState(initialSync || {});
   const [syncStatus, setSyncStatus] = useState("");
   const [tokenInput, setTokenInput] = useState("");
   const [mins, setMins] = useState(60);
@@ -82,7 +81,7 @@ function DailyPicker() {
   const [libCat, setLibCat] = useState("All");
 
   // save on every change; re-check the date whenever the app comes back to the front
-  useEffect(() => { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(st)); } catch (e) {} }, [st]);
+  useEffect(() => { saveState(st); }, [st]);
   const setStamped = (fn) => setSt((s) => ({ ...(typeof fn === "function" ? fn(s) : fn), updatedAt: Date.now() }));
 
   // ---- gist sync ----
@@ -131,10 +130,10 @@ function DailyPicker() {
         g = await r.json();
       }
       const cfg = { token, gistId: g.id };
-      localStorage.setItem(SYNC_KEY, JSON.stringify(cfg)); setSync(cfg); setTokenInput("");
+      saveSync(cfg); setSync(cfg); setTokenInput("");
     } catch (e) { setSyncStatus(String(e.message || e)); }
   };
-  const disconnectGist = () => { localStorage.removeItem(SYNC_KEY); setSync({}); setSyncStatus(""); };
+  const disconnectGist = () => { clearSync(); setSync({}); setSyncStatus(""); };
   const syncNow = async () => {
     try { setSyncStatus("checking…"); const remote = await pullFromGist(sync);
       if (remote) { setSt({ ...mergeStates(st, remote), updatedAt: Date.now() }); setSyncStatus("synced"); } else { setStamped((x) => x); }
@@ -716,5 +715,3 @@ const S = {
   barTrack: { height: 5, background: "#D9E4D6", borderRadius: 3, marginTop: 3 },
   weekCell: { borderRadius: 8, padding: "10px 0", fontSize: 14, fontWeight: 600 },
 };
-
-ReactDOM.createRoot(document.getElementById("root")).render(<DailyPicker />);
