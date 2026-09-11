@@ -35,6 +35,27 @@ export const setDailyReminder = async (hour, style) => {
   return true;
 };
 
+// Habit guardian: one-off nudges at the next 9am for slipping non-negotiables
+// (ids 20-22). Re-planned on every app run; cancelled when nothing is slipping.
+export const setHabitNudges = async (habits) => {
+  if (!canNotify) return;
+  await LocalNotifications.cancel({ notifications: [20, 21, 22].map((id) => ({ id })) }).catch(() => {});
+  if (!habits.length) return;
+  const perm = await LocalNotifications.requestPermissions();
+  if (perm.display !== "granted") return;
+  const at = new Date();
+  if (at.getHours() >= 9) at.setDate(at.getDate() + 1);
+  at.setHours(9, 0, 0, 0);
+  await LocalNotifications.schedule({
+    notifications: habits.slice(0, 3).map((h, i) => ({
+      id: 20 + i,
+      title: "Today",
+      body: `★ “${h.name}” has drifted for ${h.days} days. This would be a good morning to bring it back.`,
+      schedule: { at: new Date(at.getTime() + i * 2 * 60 * 1000) },
+    })),
+  });
+};
+
 // One-off full-screen alarm for a single task ("today at HH:MM").
 export const setTaskAlarm = async (uuid, hour, minute, title) => {
   if (!canNotify) return false;

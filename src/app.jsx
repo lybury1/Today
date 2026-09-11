@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { saveState, saveSync, clearSync } from "./storage.js";
-import { canNotify, setDailyReminder, setTaskAlarm, cancelTaskAlarm, setCheckIns } from "./notify.js";
+import { canNotify, setDailyReminder, setTaskAlarm, cancelTaskAlarm, setCheckIns, setHabitNudges } from "./notify.js";
 import { loadCoachKey, saveCoachKey, clearCoachKey } from "./storage.js";
 import { buildDigest, generateCoachNote, generateDailyLine } from "./coach.js";
 import { canWidget, pushWidgetData, pullPendingDone } from "./widget.js";
@@ -471,6 +471,20 @@ export default function DailyPicker({ initial, initialSync }) {
   const deleteCustom = (t) => setStamped((s) => { const c = { ...s.custom }; delete c[t.id]; const a = { ...s.active }; delete a[t.id]; return { ...s, custom: c, active: a, removed: { ...(s.removed || {}), [t.id]: day } }; });
   const reset = () => { if (window.confirm("Reset everything to the starter set?")) setStamped(seedState()); };
 
+  // habit guardian: a ★ habit is "slipping" once it's half again past its rhythm
+  const slippingHabits = activeTasks
+    .filter((t) => t.keystone && !t.once && t.u >= 1.5)
+    .sort((a, b) => b.u - a.u)
+    .map((t) => ({ t, days: uDay - (active[t.id]?.lastDone ?? uDay) }));
+  const habitNudgeRef = React.useRef("");
+  useEffect(() => {
+    if (!canNotify || holiday) return;
+    const sig = JSON.stringify(slippingHabits.map((h) => [h.t.id, h.days]));
+    if (sig === habitNudgeRef.current) return;
+    habitNudgeRef.current = sig;
+    setHabitNudges(slippingHabits.map((h) => ({ name: h.t.name, days: h.days })));
+  }, [day, active, overrides]);
+
   // keep the check-in nudges naming the current top pick (native only, throttled by name)
   const lastCheckInTopRef = React.useRef(null);
   useEffect(() => {
@@ -595,6 +609,15 @@ export default function DailyPicker({ initial, initialSync }) {
             )}
             {st.coachLine?.day === day && st.coachLine.text && (
               <div style={{ fontSize: 13, fontStyle: "italic", color: ink, opacity: 0.65, margin: "0 0 12px", lineHeight: 1.4 }}>{st.coachLine.text}</div>
+            )}
+            {!holiday && slippingHabits.length > 0 && !pinnedIds.includes(slippingHabits[0].t.id) && !doneToday.includes(slippingHabits[0].t.id) && (
+              <div style={{ ...S.nudge, marginTop: 0, marginBottom: 12 }}>
+                ★ <b>{slippingHabits[0].t.name}</b> is drifting — {slippingHabits[0].days} days since last. Bring it back?
+                <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
+                  <button style={S.addBtnSm} onClick={() => pin(slippingHabits[0].t)}>pin it today</button>
+                  {canNotify && <button style={S.addBtnSm} onClick={() => setTaskAlarmFor(slippingHabits[0].t, "09:00")}>alarm at 9:00</button>}
+                </div>
+              </div>
             )}
             <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
               <input style={{ ...S.search, marginBottom: 0, flex: 1 }} placeholder="Add a one-off, or search everything…" value={qa}
@@ -761,6 +784,35 @@ export default function DailyPicker({ initial, initialSync }) {
               ) : (
                 <div style={S.empty}>{weekOffset ? "Nothing logged last week. That's allowed." : "Nothing yet this week — the week is young."}</div>
               )}
+              {(() => {
+                // ---- habit dashboard: every ★ non-negotiable, tracked over 4 weeks ----
+                const habits = activeTasks.filter((t) => t.keystone && !t.once);
+                if (!habits.length) return null;
+                return (
+                  <div>
+                    <div style={S.sectionTitle}>★ Habits — last 4 weeks</div>
+                    {habits.map((t) => {
+                      const hist = active[t.id]?.history || [];
+                      const last28 = hist.filter((d) => day - d < 28).length;
+                      const prev28 = hist.filter((d) => day - d >= 28 && day - d < 56).length;
+                      const expected = Math.max(1, Math.round(28 / t.cadence));
+                      const rate = Math.min(1, last28 / expected);
+                      const trend = last28 > prev28 ? "▲ building" : last28 < prev28 ? "▽ easing" : "→ steady";
+                      const sinceLast = uDay - (active[t.id]?.lastDone ?? uDay);
+                      return (
+                        <div key={t.id} style={{ margin: "8px 0", cursor: "pointer" }} onClick={() => setOpen(t.id)}>
+                          <div style={{ display: "flex", fontSize: 13, alignItems: "baseline" }}>
+                            <span style={{ flex: 1 }}><span style={{ color: "#C9892A" }}>★ </span>{t.name}</span>
+                            <span style={S.meta}>{last28} of ~{expected} · {trend}</span>
+                          </div>
+                          <div style={S.barTrack}><div style={{ ...S.xpFill, width: `${rate * 100}%`, background: rate >= 0.7 ? moss : "#C9892A" }} /></div>
+                          <div style={S.meta}>{sinceLast === 0 ? "done today" : `last done ${sinceLast}d ago`} · aims for every ~{t.cadence}d</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
               {coachKey && weekOffset === 0 && (
                 <div style={{ ...S.nudge, marginTop: 16 }}>
                   <div style={{ display: "flex", alignItems: "baseline" }}>
