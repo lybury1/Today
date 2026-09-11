@@ -627,7 +627,7 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
           <select style={S.select} value={t.cat} onChange={(e) => onEdit({ cat: e.target.value })}>{cats.filter((c) => c !== "One-off").map((c) => <option key={c}>{c}</option>)}</select>
         </Field>)}
         {!t.once && (<Field label="Roughly every">
-          <input type="number" min="1" style={S.num} value={t.cadence} onChange={(e) => onEdit({ cadence: Math.max(1, +e.target.value || 1) })} /> <span style={S.meta}>days</span>
+          <NumField value={t.cadence} onCommit={(n) => onEdit({ cadence: n })} /> <span style={S.meta}>days</span>
         </Field>)}
         <Field label="Can happen">
           <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
@@ -642,7 +642,7 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
           </div>
         </Field>
         <Field label="Takes about">
-          <input type="number" min="1" style={S.num} value={t.effort} onChange={(e) => onEdit({ effort: Math.max(1, +e.target.value || 1) })} /> <span style={S.meta}>min</span>
+          <NumField value={t.effort} onCommit={(n) => onEdit({ effort: n })} /> <span style={S.meta}>min</span>
         </Field>
         <Field label="Needs">
           <div style={{ display: "flex", gap: 4 }}>{[[1, "Low energy"], [2, "Some"], [3, "Real effort"]].map(([e, l]) => <Chip key={e} on={t.energy === e} onClick={() => onEdit({ energy: e })}>{l}</Chip>)}</div>
@@ -710,6 +710,18 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
 }
 
 // ============ BITS ============
+// Number input that tolerates being emptied while retyping; snaps to a sane
+// value on blur instead of fighting every keystroke.
+function NumField({ value, onCommit }) {
+  const [v, setV] = useState(String(value));
+  useEffect(() => { setV(String(value)); }, [value]);
+  return (
+    <input type="number" min="1" inputMode="numeric" style={S.num} value={v}
+      onChange={(e) => { setV(e.target.value); const n = Math.round(+e.target.value); if (e.target.value !== "" && n >= 1) onCommit(n); }}
+      onBlur={() => { const n = Math.max(1, Math.round(+v) || 1); setV(String(n)); onCommit(n); }} />
+  );
+}
+
 const Field = ({ label, children }) => (
   <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "10px 0" }}>
     <div style={{ ...S.meta, width: 92, flexShrink: 0 }}>{label}</div><div style={{ flex: 1 }}>{children}</div>
