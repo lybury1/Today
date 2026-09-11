@@ -212,11 +212,23 @@ export default function DailyPicker({ initial, initialSync }) {
   }, [surfaced, mins, energy, pinnedIds]);
   const others = surfaced.filter((t) => !picks.includes(t)).sort((a, b) => b.u - a.u);
 
-  // keep the home-screen widget in step with today's picks (native only)
+  // keep the home-screen widgets in step with today's picks + this week (native only)
   useEffect(() => {
     if (!canWidget) return;
-    pushWidgetData({ date: `${DAYS[weekday]} ${dateOf(day).getDate()} ${dateOf(day).toLocaleString("en-GB", { month: "long" })}`, items: picks.map((t) => ({ name: t.name || "(untitled)", cat: t.cat, effort: t.effort, u: urgencyWord(t.u) })) });
-  }, [picks, day]);
+    const ws = weekStart(day);
+    const perDay = Array(7).fill(0); const catCounts = {};
+    Object.keys(active).forEach((id) => { const t = taskOf(id); if (!t) return;
+      (active[id].history || []).forEach((d) => { if (d >= ws && d <= ws + 6) { perDay[d - ws]++; catCounts[t.cat] = (catCounts[t.cat] || 0) + 1; } }); });
+    (st.doneOnce || []).forEach((x) => { if (x.day >= ws && x.day <= ws + 6) { perDay[x.day - ws]++; catCounts["One-off"] = (catCounts["One-off"] || 0) + 1; } });
+    pushWidgetData({
+      date: `${DAYS[weekday]} ${dateOf(day).getDate()} ${dateOf(day).toLocaleString("en-GB", { month: "long" })}`,
+      items: picks.map((t) => ({ name: t.name || "(untitled)", cat: t.cat, effort: t.effort, u: urgencyWord(t.u) })),
+      week: {
+        days: perDay, todayIdx: day - ws, total: perDay.reduce((a, b) => a + b, 0),
+        cats: Object.entries(catCounts).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([name, n]) => ({ name, n })),
+      },
+    });
+  }, [picks, day, active]);
   const hidden = activeTasks.filter((t) => t.opps !== null && !t.opps.includes(weekday));
 
   // ---- actions ----
