@@ -1,6 +1,8 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { saveState, saveSync, clearSync } from "./storage.js";
 import { canNotify, setDailyReminder, setTaskAlarm, cancelTaskAlarm, setCheckIns } from "./notify.js";
+import { loadCoachKey, saveCoachKey, clearCoachKey } from "./storage.js";
+import { buildDigest, generateCoachNote } from "./coach.js";
 import { canWidget, pushWidgetData, pullPendingDone } from "./widget.js";
 
 // ============ LIBRARY (see tasks.js) ============
@@ -114,6 +116,10 @@ export default function DailyPicker({ initial, initialSync }) {
   const [byCat, setByCat] = useState(false);
   const [weekOffset, setWeekOffset] = useState(0);
   const [moreAnyway, setMoreAnyway] = useState(false); // "show more anyway" past today's budget
+  const [coachKey, setCoachKey] = useState("");
+  const [coachKeyInput, setCoachKeyInput] = useState("");
+  const [coachBusy, setCoachBusy] = useState("");
+  useEffect(() => { loadCoachKey().then((k) => setCoachKey(k)); }, []);
   const [qa, setQa] = useState(""); // quick-add / search box on Today
   const [mineFilter, setMineFilter] = useState("");
   const [open, setOpen] = useState(null); // task id in detail view
@@ -490,6 +496,19 @@ export default function DailyPicker({ initial, initialSync }) {
     return () => { document.removeEventListener("visibilitychange", drain); window.removeEventListener("focus", drain); };
   }, []);
 
+  const writeCoachNote = async () => {
+    if (!coachKey || coachBusy) return;
+    setCoachBusy("thinking about your week…");
+    const ws = weekStart(day);
+    const digest = buildDigest({ st, day, weekStartDay: ws, taskOf, activeTasks, dateOf, DAYS });
+    const result = await generateCoachNote(coachKey, digest);
+    if (result && result.badKey) { setCoachBusy("key rejected — check it in ⚙"); return; }
+    if (typeof result === "string") {
+      setStamped((s) => ({ ...s, coachNote: { week: ws, text: result, at: Date.now() } }));
+      setCoachBusy("");
+    } else setCoachBusy("couldn't reach the coach — try again later");
+  };
+
   const level = Math.floor(points / 100) + 1;
   const openTask = open ? taskOf(open) : null;
 
@@ -689,6 +708,22 @@ export default function DailyPicker({ initial, initialSync }) {
               ) : (
                 <div style={S.empty}>{weekOffset ? "Nothing logged last week. That's allowed." : "Nothing yet this week — the week is young."}</div>
               )}
+              {coachKey && weekOffset === 0 && (
+                <div style={{ ...S.nudge, marginTop: 16 }}>
+                  <div style={{ display: "flex", alignItems: "baseline" }}>
+                    <div style={{ fontWeight: 600, marginBottom: 6 }}>Coach's note</div>
+                    <span style={{ flex: 1 }} />
+                    <button style={S.linkBtn} onClick={writeCoachNote}>{st.coachNote?.week === weekStart(day) ? "fresh note" : "write this week's note"}</button>
+                  </div>
+                  {coachBusy ? (
+                    <div style={{ opacity: 0.6 }}>{coachBusy}</div>
+                  ) : st.coachNote?.week === weekStart(day) ? (
+                    <div style={{ lineHeight: 1.5 }}>{st.coachNote.text}</div>
+                  ) : (
+                    <div style={{ opacity: 0.6 }}>No note for this week yet.</div>
+                  )}
+                </div>
+              )}
               {(() => {
                 // ---- coach: what the app has quietly learned ----
                 const allLogs = Object.entries(st.tlog || {}).flatMap(([id, arr]) => arr.map(([d, m]) => ({ id, d, m })));
@@ -831,6 +866,20 @@ export default function DailyPicker({ initial, initialSync }) {
                 </div>
                 <div style={S.footnote}>Quiet nudges to glance at the list. 2× is 10:00 &amp; 16:00, 3× is 9:00 / 13:00 / 18:00, 5× is every ~3h from 9:00 to 21:00.</div>
               </>
+            )}
+
+            <div style={S.sectionTitle}>Coach (Claude API)</div>
+            {coachKey ? (
+              <div>
+                <div style={{ fontSize: 14 }}>Connected · a short weekly note appears in the Week tab</div>
+                <button style={{ ...S.linkBtn, marginTop: 4 }} onClick={() => { clearCoachKey(); setCoachKey(""); }}>disconnect</button>
+              </div>
+            ) : (
+              <div>
+                <div style={S.footnote}>Paste an Anthropic API key (console.anthropic.com → API Keys). The coach reads a small weekly summary — never your full history — and writes a few kind sentences about your week. Costs roughly a penny a note, from your own credits.</div>
+                <input style={S.search} placeholder="sk-ant-…" value={coachKeyInput} onChange={(e) => setCoachKeyInput(e.target.value)} autoCapitalize="off" autoCorrect="off" />
+                <button style={S.addBtnSm} onClick={() => { const k = coachKeyInput.trim(); if (k) { saveCoachKey(k); setCoachKey(k); setCoachKeyInput(""); } }}>Connect</button>
+              </div>
             )}
 
             <div style={S.sectionTitle}>Going away?</div>

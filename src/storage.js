@@ -35,3 +35,8 @@ export const saveSync = async (cfg) => {
 export const clearSync = async () => {
   try { await del(SYNC_KEY); } catch (e) {}
 };
+
+const COACH_KEY = "today-app-coach";
+export const loadCoachKey = async () => { try { return (await get(COACH_KEY)) || ""; } catch (e) { return ""; } };
+export const saveCoachKey = async (k) => { try { await set(COACH_KEY, k); } catch (e) {} };
+export const clearCoachKey = async () => { try { await del(COACH_KEY); } catch (e) {} };
