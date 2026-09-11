@@ -693,7 +693,7 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
         <div style={{ display: "flex", gap: 8, marginTop: 20, flexWrap: "wrap", alignItems: "center" }}>
           {isActive ? (
             <>
-              <button style={S.doneBtn} onClick={() => { onDone(); if (t.once) onClose(); }} disabled={doneToday}>{doneToday ? "Done today" : t.once ? "Done" : "Mark done today"}</button>
+              <button style={S.doneBtn} onClick={() => { onDone(); onClose(); }} disabled={doneToday}>{doneToday ? "Done today" : t.once ? "Done" : "Mark done today"}</button>
               {!doneToday && <button style={S.addBtnSm} onClick={onPin}>{pinned ? "Unpin" : "Do today"}</button>}
               {!doneToday && !snoozedUntil && <button style={S.linkBtn} onClick={onSkipWeek}>not this week</button>}
               <button style={S.linkBtn} onClick={onRemove}>{t.once ? "delete" : "stop tracking"}</button>
