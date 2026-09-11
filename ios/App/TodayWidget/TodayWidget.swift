@@ -1,14 +1,46 @@
 import WidgetKit
 import SwiftUI
+import AppIntents
 
 // Reads the JSON snapshot the app writes to the shared app-group container.
 // The app pushes a fresh snapshot (and a reload) whenever the day's picks change.
 
 struct PickItem: Decodable {
+    let id: String?
     let name: String
     let cat: String
     let effort: Int
     let u: String
+}
+
+// Tick a pick Done straight from the widget: queue the id for the app to apply,
+// optimistically drop the row from the stored snapshot, refresh.
+struct MarkDoneIntent: AppIntent {
+    static var title: LocalizedStringResource = "Mark task done"
+    static var isDiscoverable: Bool = false
+
+    @Parameter(title: "Task ID") var taskId: String
+
+    init() {}
+    init(taskId: String) { self.taskId = taskId }
+
+    func perform() async throws -> some IntentResult {
+        let d = UserDefaults(suiteName: "group.com.lybury1.today")
+        var pending = d?.stringArray(forKey: "pending-done") ?? []
+        if !pending.contains(taskId) { pending.append(taskId) }
+        d?.set(pending, forKey: "pending-done")
+        if let s = d?.string(forKey: "widget-data"),
+           var obj = try? JSONSerialization.jsonObject(with: Data(s.utf8)) as? [String: Any],
+           var items = obj["items"] as? [[String: Any]] {
+            items.removeAll { ($0["id"] as? String) == taskId }
+            obj["items"] = items
+            if let out = try? JSONSerialization.data(withJSONObject: obj), let str = String(data: out, encoding: .utf8) {
+                d?.set(str, forKey: "widget-data")
+            }
+        }
+        WidgetCenter.shared.reloadAllTimelines()
+        return .result()
+    }
 }
 
 struct CatCount: Decodable {
@@ -25,6 +57,7 @@ struct WeekData: Decodable {
 
 struct Payload: Decodable {
     let date: String
+    let day: Int?
     let items: [PickItem]
     let week: WeekData?
 }
@@ -32,6 +65,14 @@ struct Payload: Decodable {
 struct PicksEntry: TimelineEntry {
     let date: Date
     let payload: Payload?
+    var stale: Bool = false
+}
+
+// Days since 1 Jan 2026 in the local calendar — must match todayIndex() in app.jsx.
+private func dayIndex(_ date: Date) -> Int {
+    let cal = Calendar.current
+    let epoch = cal.date(from: DateComponents(year: 2026, month: 1, day: 1)) ?? date
+    return cal.dateComponents([.day], from: cal.startOfDay(for: epoch), to: cal.startOfDay(for: date)).day ?? 0
 }
 
 struct Provider: TimelineProvider {
@@ -42,9 +83,9 @@ struct Provider: TimelineProvider {
     }
 
     func placeholder(in context: Context) -> PicksEntry {
-        PicksEntry(date: .now, payload: Payload(date: "Today", items: [
-            PickItem(name: "Stretch 10 min", cat: "Body", effort: 10, u: "ready"),
-            PickItem(name: "Water plants", cat: "Home", effort: 5, u: "ready"),
+        PicksEntry(date: .now, payload: Payload(date: "Today", day: nil, items: [
+            PickItem(id: nil, name: "Stretch 10 min", cat: "Body", effort: 10, u: "ready"),
+            PickItem(id: nil, name: "Water plants", cat: "Home", effort: 5, u: "ready"),
         ], week: WeekData(days: [2, 1, 0, 3, 1, 0, 0], todayIdx: 4, total: 7, cats: [CatCount(name: "Home", n: 4), CatCount(name: "Body", n: 3)])))
     }
 
@@ -53,10 +94,17 @@ struct Provider: TimelineProvider {
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<PicksEntry>) -> Void) {
-        // One entry now; ask for a refresh just after midnight so the date rolls
-        // over even if the app isn't opened. The app also reloads us on change.
-        let next = Calendar.current.nextDate(after: .now, matching: DateComponents(hour: 0, minute: 5), matchingPolicy: .nextTime) ?? .now.addingTimeInterval(3600)
-        completion(Timeline(entries: [PicksEntry(date: .now, payload: load())], policy: .after(next)))
+        // Entry for now, plus one just after midnight that knows yesterday's data
+        // is stale — so the widget never shows the wrong day's picks all morning.
+        let payload = load()
+        let staleNow = payload?.day != nil && payload!.day! != dayIndex(.now)
+        var entries = [PicksEntry(date: .now, payload: payload, stale: staleNow)]
+        let cal = Calendar.current
+        if let midnight = cal.nextDate(after: .now, matching: DateComponents(hour: 0, minute: 2), matchingPolicy: .nextTime) {
+            entries.append(PicksEntry(date: midnight, payload: payload, stale: payload?.day != nil && payload!.day! != dayIndex(midnight)))
+        }
+        let next = cal.nextDate(after: .now, matching: DateComponents(hour: 0, minute: 5), matchingPolicy: .nextTime) ?? .now.addingTimeInterval(3600)
+        completion(Timeline(entries: entries, policy: .after(next)))
     }
 }
 
@@ -88,11 +136,15 @@ struct TodayWidgetView: View {
             // Lock screen: glanceable, tap opens the app
             VStack(alignment: .leading, spacing: 1) {
                 Text("Today").font(.caption2.weight(.semibold))
-                ForEach(Array((entry.payload?.items ?? []).prefix(2).enumerated()), id: \.offset) { _, item in
-                    Text("· \(item.name)").font(.caption2).lineLimit(1)
-                }
-                if (entry.payload?.items ?? []).isEmpty {
-                    Text("All clear").font(.caption2)
+                if entry.stale {
+                    Text("New day — tap for fresh picks").font(.caption2)
+                } else {
+                    ForEach(Array((entry.payload?.items ?? []).prefix(2).enumerated()), id: \.offset) { _, item in
+                        Text("· \(item.name)").font(.caption2).lineLimit(1)
+                    }
+                    if (entry.payload?.items ?? []).isEmpty {
+                        Text("All clear").font(.caption2)
+                    }
                 }
             }
             .containerBackground(for: .widget) { Color.clear }
@@ -109,7 +161,11 @@ struct TodayWidgetView: View {
                             .foregroundStyle(ink.opacity(0.5))
                     }
                 }
-                if let items = entry.payload?.items, !items.isEmpty {
+                if entry.stale {
+                    Text("New day — open Today to deal a fresh set.")
+                        .font(.footnote)
+                        .foregroundStyle(ink.opacity(0.55))
+                } else if let items = entry.payload?.items, !items.isEmpty {
                     ForEach(Array(items.prefix(maxRows).enumerated()), id: \.offset) { _, item in
                         HStack(spacing: 8) {
                             Circle().fill(dotColor(item.u)).frame(width: 8, height: 8)
@@ -121,6 +177,14 @@ struct TodayWidgetView: View {
                             Text("\(item.effort)m")
                                 .font(.caption2)
                                 .foregroundStyle(ink.opacity(0.45))
+                            if let id = item.id {
+                                Button(intent: MarkDoneIntent(taskId: id)) {
+                                    Image(systemName: "checkmark.circle")
+                                        .font(.system(size: 17, weight: .medium))
+                                        .foregroundStyle(moss.opacity(0.6))
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                     }
                     if let extra = entry.payload.map({ $0.items.count - maxRows }), extra > 0 {

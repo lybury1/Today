@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { saveState, saveSync, clearSync } from "./storage.js";
 import { canNotify, setDailyReminder, setTaskAlarm, cancelTaskAlarm, setCheckIns } from "./notify.js";
-import { canWidget, pushWidgetData } from "./widget.js";
+import { canWidget, pushWidgetData, pullPendingDone } from "./widget.js";
 
 // ============ LIBRARY (see tasks.js) ============
 const RAW = window.TASK_LIBRARY;
@@ -37,6 +37,11 @@ const seedState = () => {
 };
 
 const urgencyWord = (u) => (u < 0.6 ? "fresh" : u < 1 ? "coming up" : u < 1.6 ? "ready" : u < 2.5 ? "been a while" : "long time");
+// snooze entries are { until, at } (timestamped so deletions survive sync merges); bare numbers are legacy
+const snUntil = (v) => (typeof v === "number" ? v : (v && v.until) || 0);
+const snAt = (v) => (typeof v === "number" ? 0 : (v && v.at) || 0);
+// state equality ignoring the sync timestamp — used to avoid pointless writes and churn loops
+const sameCore = (x, y) => JSON.stringify({ ...x, updatedAt: 0 }) === JSON.stringify({ ...y, updatedAt: 0 });
 
 // Merge two saved states so a device that was offline can't lose its day.
 // Histories are unioned; simple fields (settings, hidden lists, points) favour the newer state.
@@ -62,7 +67,37 @@ const mergeStates = (a, b) => {
   const doneOnce = [...(a.doneOnce || []), ...(b.doneOnce || [])]
     .filter((x) => { const k = x.name + "|" + x.day; if (seen.has(k)) return false; seen.add(k); return true; })
     .sort((x, y) => x.day - y.day).slice(-50);
-  return { ...older, ...newer, active, custom, removed, overrides: { ...(older.overrides || {}), ...(newer.overrides || {}) }, points: Math.max(a.points || 0, b.points || 0), doneOnce };
+  // snoozes: per-id, the most recent write wins (an unsnooze writes {until: 0}, so "bring back" sticks)
+  const snoozed = {};
+  for (const src of [a.snoozed, b.snoozed]) for (const [id, v] of Object.entries(src || {})) {
+    if (!(id in snoozed) || snAt(v) > snAt(snoozed[id])) snoozed[id] = v;
+  }
+  // day-scoped skips/pins: the later day always wins; same day: skips union (additive),
+  // pins follow the newer state so an unpin sticks
+  const dayScoped = (key, unionSameDay) => {
+    const na = a[key], nb = b[key];
+    if (!na || !nb) return na || nb;
+    if (na.day !== nb.day) return na.day > nb.day ? na : nb;
+    if (!unionSameDay) return newer[key] ?? na;
+    return { day: na.day, ids: [...new Set([...(na.ids || []), ...(nb.ids || [])])] };
+  };
+  // learning logs: union, capped
+  const unionLog = (key, cap) => {
+    const out = {};
+    for (const src of [older[key], newer[key]]) for (const [id, arr] of Object.entries(src || {})) {
+      const set = new Map((out[id] || []).map((e) => [JSON.stringify(e), e]));
+      for (const e of arr) set.set(JSON.stringify(e), e);
+      out[id] = [...set.values()].sort((x, y) => (Array.isArray(x) ? x[0] : x) - (Array.isArray(y) ? y[0] : y)).slice(-cap);
+    }
+    return out;
+  };
+  return {
+    ...older, ...newer, active, custom, removed,
+    overrides: { ...(older.overrides || {}), ...(newer.overrides || {}) },
+    points: Math.max(a.points || 0, b.points || 0), doneOnce,
+    snoozed, skipped: dayScoped("skipped", true), pinned: dayScoped("pinned", false),
+    tlog: unionLog("tlog", 40), skiplog: unionLog("skiplog", 20),
+  };
 };
 
 // ============ APP ============
@@ -78,6 +113,9 @@ export default function DailyPicker({ initial, initialSync }) {
   const [tab, setTab] = useState("today");
   const [byCat, setByCat] = useState(false);
   const [weekOffset, setWeekOffset] = useState(0);
+  const [moreAnyway, setMoreAnyway] = useState(false); // "show more anyway" past today's budget
+  const [qa, setQa] = useState(""); // quick-add / search box on Today
+  const [mineFilter, setMineFilter] = useState("");
   const [open, setOpen] = useState(null); // task id in detail view
   const [libFilter, setLibFilter] = useState("");
   const [libCat, setLibCat] = useState("All");
@@ -88,31 +126,75 @@ export default function DailyPicker({ initial, initialSync }) {
 
   // ---- gist sync ----
   const gh = (path, opts = {}) => fetch("https://api.github.com" + path, { ...opts, headers: { Authorization: "Bearer " + sync.token, Accept: "application/vnd.github+json", "Content-Type": "application/json", ...(opts.headers || {}) } });
+  const authFailed = (status) => status === 401 || status === 403;
+  const [syncBroken, setSyncBroken] = useState(false); // token rejected — surfaced on the Today tab
   const pullFromGist = async (cfg) => {
     const r = await fetch("https://api.github.com/gists/" + cfg.gistId, { headers: { Authorization: "Bearer " + cfg.token, Accept: "application/vnd.github+json" } });
-    if (!r.ok) throw new Error("gist read failed " + r.status);
+    if (!r.ok) { const e = new Error("gist read failed " + r.status); e.status = r.status; throw e; }
     const j = await r.json(); const f = j.files["today.json"]; if (!f) return null;
     const txt = f.truncated ? await (await fetch(f.raw_url)).text() : f.content;
     return JSON.parse(txt);
   };
+  // a local state that has never been touched should adopt the cloud wholesale (new phone),
+  // instead of merging the starter seed into real history
+  const isPristine = (s) => !s.updatedAt && (s.points || 0) === 0 && Object.values(s.active || {}).every((r) => !(r.history || []).length) && !(s.doneOnce || []).length;
+  const syncFailMsg = (e) => { if (authFailed(e.status)) { setSyncBroken(true); return "token rejected — make a new one (Settings)"; } return "offline / sync error"; };
+  // after a merge brings in a completion from another device, its local alarm is stale
+  const cancelAlarmsDoneElsewhere = (merged) => {
+    Object.entries(merged.alarms || {}).forEach(([id, a]) => {
+      if ((merged.active?.[id]?.history || []).includes(day) || !(id in (merged.active || {}))) {
+        cancelTaskAlarm(a.uuid); delete merged.alarms[id];
+      }
+    });
+    return merged;
+  };
+  const lastPullRef = React.useRef(0);
+  const pullInFlight = React.useRef(false);
+  const pullAndMerge = async (label) => {
+    if (!sync.token || !sync.gistId || pullInFlight.current) return;
+    pullInFlight.current = true;
+    lastPullRef.current = Date.now();
+    try {
+      setSyncStatus(label || "checking…");
+      const remote = await pullFromGist(sync);
+      if (remote) {
+        // functional update: merge against the state as it is NOW, not as it was
+        // before the network round-trip — otherwise concurrent taps are wiped
+        setSt((s) => {
+          const next = isPristine(s) ? { ...remote } : cancelAlarmsDoneElsewhere(mergeStates(s, remote));
+          return sameCore(next, s) ? s : { ...next, updatedAt: Date.now() };
+        });
+        setSyncStatus("synced"); setSyncBroken(false);
+      } else setSyncStatus("up to date");
+    } catch (e) { setSyncStatus(syncFailMsg(e)); }
+    finally { pullInFlight.current = false; }
+  };
+  useEffect(() => { pullAndMerge(); }, [sync.gistId]);
+  // re-pull when the app comes back to the foreground (webview lives for days on iOS)
   useEffect(() => {
-    if (!sync.token || !sync.gistId) return;
-    (async () => {
-      try {
-        setSyncStatus("checking…");
-        const remote = await pullFromGist(sync);
-        if (remote) { setSt({ ...mergeStates(st, remote), updatedAt: Date.now() }); setSyncStatus("synced"); }
-        else setSyncStatus("up to date");
-      } catch (e) { setSyncStatus("offline / sync error"); }
-    })();
-  }, [sync.gistId]);
+    const onWake = () => { if (document.visibilityState !== "hidden" && Date.now() - lastPullRef.current > 5 * 60 * 1000) pullAndMerge(); };
+    document.addEventListener("visibilitychange", onWake); window.addEventListener("focus", onWake);
+    return () => { document.removeEventListener("visibilitychange", onWake); window.removeEventListener("focus", onWake); };
+  });
   useEffect(() => {
     if (!sync.token || !sync.gistId || !st.updatedAt) return;
     const id = setTimeout(async () => {
       try {
         setSyncStatus("saving…");
-        const r = await gh("/gists/" + sync.gistId, { method: "PATCH", body: JSON.stringify({ files: { "today.json": { content: JSON.stringify(st) } } }) });
-        setSyncStatus(r.ok ? "saved to cloud " + new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : "save failed " + r.status);
+        // merge the remote in before writing, so a stale device never clobbers newer work
+        let body = st;
+        try {
+          const remote = await pullFromGist(sync);
+          if (remote && !sameCore(remote, st)) body = cancelAlarmsDoneElsewhere(mergeStates(st, remote));
+        } catch (e) { /* pull failed — push local as-is */ }
+        const r = await gh("/gists/" + sync.gistId, { method: "PATCH", body: JSON.stringify({ files: { "today.json": { content: JSON.stringify(body) } } }) });
+        if (r.ok) { setSyncStatus("saved to cloud " + new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })); setSyncBroken(false); }
+        else { setSyncStatus(authFailed(r.status) ? "token rejected — make a new one (Settings)" : "save failed " + r.status); if (authFailed(r.status)) setSyncBroken(true); }
+        // fold the merged remote back in functionally — never replace state that moved during the fetch
+        if (body !== st) setSt((s) => {
+          const next = s === st ? body : cancelAlarmsDoneElsewhere(mergeStates(s, body));
+          return sameCore(next, s) ? s : { ...next, updatedAt: Date.now() };
+        });
       } catch (e) { setSyncStatus("offline — will retry"); }
     }, 2500);
     return () => clearTimeout(id);
@@ -136,11 +218,7 @@ export default function DailyPicker({ initial, initialSync }) {
     } catch (e) { setSyncStatus(String(e.message || e)); }
   };
   const disconnectGist = () => { clearSync(); setSync({}); setSyncStatus(""); };
-  const syncNow = async () => {
-    try { setSyncStatus("checking…"); const remote = await pullFromGist(sync);
-      if (remote) { setSt({ ...mergeStates(st, remote), updatedAt: Date.now() }); setSyncStatus("synced"); } else { setStamped((x) => x); }
-    } catch (e) { setSyncStatus("offline / sync error"); }
-  };
+  const syncNow = () => pullAndMerge("syncing…");
 
   // ---- export / import ----
   const exportData = () => {
@@ -172,6 +250,7 @@ export default function DailyPicker({ initial, initialSync }) {
     const iv = setInterval(tick, 60000);
     return () => { document.removeEventListener("visibilitychange", tick); window.removeEventListener("focus", tick); clearInterval(iv); };
   }, []);
+  useEffect(() => { setMoreAnyway(false); }, [day]); // budget escape hatch resets at rollover
 
   const { active, overrides, custom, points } = st;
   const hiddenLib = st.hiddenLib || [];
@@ -197,20 +276,45 @@ export default function DailyPicker({ initial, initialSync }) {
     [active, overrides, custom, uDay]
   );
 
-  const surfaced = activeTasks.filter((t) => (t.opps === null || t.opps.includes(weekday)) && !doneToday.includes(t.id) && !skipped.includes(t.id) && !(snoozed[t.id] > day));
+  const surfaced = activeTasks.filter((t) => (t.opps === null || t.opps.includes(weekday)) && !doneToday.includes(t.id) && !skipped.includes(t.id) && !(snUntil(snoozed[t.id]) > day));
+
+  // effort already completed today draws down the time budget, so a day can actually finish
+  const spentToday = doneToday.reduce((a, id) => { const t = taskOf(id); return a + (t ? t.effort : 0); }, 0)
+    + (st.doneOnce || []).filter((x) => x.day === day).reduce((a, x) => a + (x.effort || 0), 0);
+
+  // learned time-of-day fit: fraction of this task's logged completions within ±2h of now
+  const tlog = st.tlog || {};
+  const nowMin = (() => { const n = new Date(); return n.getHours() * 60 + n.getMinutes(); })();
+  const timeFit = (id) => {
+    const logs = tlog[id] || [];
+    if (logs.length < 4) return 0;
+    const near = logs.filter(([, m]) => Math.abs(m - nowMin) <= 120 || Math.abs(m - nowMin) >= 1320).length;
+    return near / logs.length;
+  };
+
   const picks = useMemo(() => {
     const pinnedTasks = surfaced.filter((t) => pinnedIds.includes(t.id));
-    const sorted = surfaced.filter((t) => !pinnedIds.includes(t.id)).sort((a, b) => b.u - a.u);
+    const rest = surfaced.filter((t) => !pinnedIds.includes(t.id)).map((t) => ({ ...t, fit: timeFit(t.id) }));
+    // non-negotiables that are due go first and ignore the energy filter — they don't slip
+    const keystones = rest.filter((t) => t.keystone && t.u >= 1).sort((a, b) => b.u - a.u);
+    const sorted = rest.filter((t) => !keystones.includes(t))
+      .sort((a, b) => (b.u * (1 + 0.15 * b.fit)) - (a.u * (1 + 0.15 * a.fit)));
     const out = [...pinnedTasks];
-    let left = Math.max(0, mins - pinnedTasks.reduce((a, t) => a + t.effort, 0));
+    const budget = moreAnyway ? mins : Math.max(0, mins - spentToday);
+    let left = Math.max(0, budget - pinnedTasks.reduce((a, t) => a + t.effort, 0));
+    for (const t of keystones) {
+      if (out.length >= 8 || t.effort > left) continue;
+      out.push(t); left -= t.effort;
+    }
     for (const t of sorted) {
       if (out.length >= 8) break;
       const okEnergy = t.energy <= energy || (t.energy === energy + 1 && t.u > 1.5);
       if (okEnergy && t.effort <= left) { out.push(t); left -= t.effort; }
     }
     return out;
-  }, [surfaced, mins, energy, pinnedIds]);
-  const others = surfaced.filter((t) => !picks.includes(t)).sort((a, b) => b.u - a.u);
+  }, [surfaced, mins, energy, pinnedIds, spentToday, moreAnyway, nowMin]);
+  const pickIds = new Set(picks.map((t) => t.id));
+  const others = surfaced.filter((t) => !pickIds.has(t.id)).sort((a, b) => b.u - a.u);
 
   // keep the home-screen widgets in step with today's picks + this week (native only)
   useEffect(() => {
@@ -222,7 +326,8 @@ export default function DailyPicker({ initial, initialSync }) {
     (st.doneOnce || []).forEach((x) => { if (x.day >= ws && x.day <= ws + 6) { perDay[x.day - ws]++; catCounts["One-off"] = (catCounts["One-off"] || 0) + 1; } });
     pushWidgetData({
       date: `${DAYS[weekday]} ${dateOf(day).getDate()} ${dateOf(day).toLocaleString("en-GB", { month: "long" })}`,
-      items: picks.map((t) => ({ name: t.name || "(untitled)", cat: t.cat, effort: t.effort, u: urgencyWord(t.u) })),
+      day,
+      items: picks.map((t) => ({ id: t.id, name: t.name || "(untitled)", cat: t.cat, effort: t.effort, u: urgencyWord(t.u) })),
       week: {
         days: perDay, todayIdx: day - ws, total: perDay.reduce((a, b) => a + b, 0),
         cats: Object.entries(catCounts).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([name, n]) => ({ name, n })),
@@ -231,18 +336,33 @@ export default function DailyPicker({ initial, initialSync }) {
   }, [picks, day, active]);
   const hidden = activeTasks.filter((t) => t.opps !== null && !t.opps.includes(weekday));
 
+  const mineMatch = (t) => { const f = mineFilter.trim().toLowerCase(); return !f || t.name.toLowerCase().includes(f) || t.cat.toLowerCase().includes(f); };
+  // quick-add search: tracked tasks first, then untracked library matches; name or category
+  const searchMatches = useMemo(() => {
+    const f = qa.trim().toLowerCase(); if (!f) return [];
+    const match = (t) => t && !t.once && (t.name.toLowerCase().includes(f) || t.cat.toLowerCase().includes(f)) && !hiddenLib.includes(t.id);
+    const tracked = activeTasks.filter((t) => match(t)).map((t) => ({ t, tracked: true }));
+    const activeIds = new Set(Object.keys(active));
+    const lib = allDefs.filter((t) => match(t) && !activeIds.has(t.id)).map((t) => ({ t, tracked: false }));
+    return [...tracked, ...lib].slice(0, 6);
+  }, [qa, activeTasks, allDefs, hiddenLib, active]);
+
   // ---- actions ----
   const done = (t) => {
     const priorAlarm = st.alarms?.[t.id]; if (priorAlarm) cancelTaskAlarm(priorAlarm.uuid);
+    const n = new Date(); const minute = n.getHours() * 60 + n.getMinutes();
     setStamped((s) => {
+      if (!t.once && (s.active[t.id]?.history || []).includes(day)) return s; // already done today
       const alarms = { ...(s.alarms || {}) }; delete alarms[t.id];
+      const tl = { ...(s.tlog || {}) };
+      tl[t.id] = [...(tl[t.id] || []), [day, minute]].slice(-40);
       const pts = s.points + Math.max(5, Math.round(t.effort / 3)) + (t.u > 1.5 ? 5 : 0);
       if (t.once) {
         const a = { ...s.active }; delete a[t.id];
         const c = { ...s.custom }; delete c[t.id];
-        return { ...s, active: a, custom: c, alarms, removed: { ...(s.removed || {}), [t.id]: day }, points: pts, doneOnce: [...(s.doneOnce || []), { name: t.name, day }].slice(-50) };
+        return { ...s, active: a, custom: c, alarms, tlog: tl, removed: { ...(s.removed || {}), [t.id]: day }, points: pts, doneOnce: [...(s.doneOnce || []), { name: t.name, day, effort: t.effort }].slice(-50) };
       }
-      return { ...s, active: { ...s.active, [t.id]: { ...s.active[t.id], lastDone: day, history: [...(s.active[t.id]?.history || []), day] } }, alarms, points: pts };
+      return { ...s, active: { ...s.active, [t.id]: { ...s.active[t.id], lastDone: day, history: [...(s.active[t.id]?.history || []), day] } }, alarms, tlog: tl, points: pts };
     });
   };
   const undo = (t) => {
@@ -251,13 +371,15 @@ export default function DailyPicker({ initial, initialSync }) {
       return { ...s, active: { ...s.active, [t.id]: { lastDone: h.length ? h[h.length - 1] : day - t.cadence, history: h } } };
     });
   };
-  const skip = (t) => setStamped((s) => ({ ...s, skipped: { day, ids: [...(s.skipped?.day === day ? s.skipped.ids : []), t.id] }, pinned: s.pinned?.day === day ? { day, ids: s.pinned.ids.filter((x) => x !== t.id) } : s.pinned }));
+  const logSkip = (s, id) => ({ ...(s.skiplog || {}), [id]: [...((s.skiplog || {})[id] || []), day].slice(-20) });
+  const skip = (t) => setStamped((s) => ({ ...s, skipped: { day, ids: [...(s.skipped?.day === day ? s.skipped.ids : []), t.id] }, skiplog: logSkip(s, t.id), pinned: s.pinned?.day === day ? { day, ids: s.pinned.ids.filter((x) => x !== t.id) } : s.pinned }));
   const skipWeek = (t) => setStamped((s) => ({
     ...s,
-    snoozed: { ...Object.fromEntries(Object.entries(s.snoozed || {}).filter(([, u]) => u > day)), [t.id]: nextMonday(day) },
+    snoozed: { ...Object.fromEntries(Object.entries(s.snoozed || {}).filter(([, v]) => snUntil(v) > day)), [t.id]: { until: nextMonday(day), at: Date.now() } },
+    skiplog: logSkip(s, t.id),
     pinned: s.pinned?.day === day ? { day, ids: s.pinned.ids.filter((x) => x !== t.id) } : s.pinned,
   }));
-  const unsnooze = (id) => setStamped((s) => { const sn = { ...(s.snoozed || {}) }; delete sn[id]; return { ...s, snoozed: sn }; });
+  const unsnooze = (id) => setStamped((s) => ({ ...s, snoozed: { ...(s.snoozed || {}), [id]: { until: 0, at: Date.now() } } }));
   const pin = (t) => setStamped((s) => { const ids = s.pinned?.day === day ? s.pinned.ids : [];
     return { ...s, pinned: { day, ids: ids.includes(t.id) ? ids.filter((x) => x !== t.id) : [...ids, t.id] } }; });
   const setReminderTo = async (h, styleArg) => {
@@ -277,16 +399,40 @@ export default function DailyPicker({ initial, initialSync }) {
     const a = st.alarms?.[t.id]; if (a) cancelTaskAlarm(a.uuid);
     setStamped((s) => { const al = { ...(s.alarms || {}) }; delete al[t.id]; return { ...s, alarms: al }; });
   };
-  const startHoliday = () => setStamped((s) => ({ ...s, holiday: { since: day } }));
-  const endHoliday = () => setStamped((s) => {
-    const gap = day - s.holiday.since; const a = {};
-    Object.entries(s.active).forEach(([id, r]) => { a[id] = { ...r, lastDone: Math.min(day, r.lastDone + gap), ...(r.added != null ? { added: Math.min(day, r.added + gap) } : {}) }; });
-    return { ...s, active: a, holiday: null };
-  });
+  const startHoliday = () => {
+    if (canNotify) { // silence everything for the break; settings are kept and restored on return
+      setDailyReminder(null, st.reminderStyle);
+      setCheckIns(0);
+      Object.values(st.alarms || {}).forEach((a) => cancelTaskAlarm(a.uuid));
+    }
+    setStamped((s) => ({ ...s, holiday: { since: day }, alarms: {} }));
+  };
+  const endHoliday = () => {
+    if (canNotify) {
+      if (st.reminder != null) setDailyReminder(st.reminder, st.reminderStyle ?? "gentle");
+      if (st.checkIns) setCheckIns(st.checkIns);
+    }
+    setStamped((s) => {
+      const gap = day - s.holiday.since; const a = {};
+      Object.entries(s.active).forEach(([id, r]) => { a[id] = { ...r, lastDone: Math.min(day, r.lastDone + gap), ...(r.added != null ? { added: Math.min(day, r.added + gap) } : {}) }; });
+      return { ...s, active: a, holiday: null };
+    });
+  };
   const add = (t) => setStamped((s) => { const removed = { ...(s.removed || {}) }; delete removed[t.id];
     return { ...s, removed, active: { ...s.active, [t.id]: { lastDone: day - Math.round(t.cadence * 0.5), history: [] } } }; });
   const remove = (t) => setStamped((s) => { const a = { ...s.active }; delete a[t.id]; return { ...s, active: a, removed: { ...(s.removed || {}), [t.id]: day } }; });
   const edit = (id, patch) => setStamped((s) => ({ ...s, overrides: { ...s.overrides, [id]: { ...(s.overrides[id] || {}), ...patch } } }));
+  const createOneOffNamed = (name) => {
+    const id = `custom:${Date.now()}`;
+    setStamped((s) => ({
+      ...s,
+      custom: { ...s.custom, [id]: { id, name, cat: "One-off", cadence: 7, opps: null, effort: 15, energy: 1, once: true } },
+      active: { ...s.active, [id]: { lastDone: day - 3, added: day, history: [] } },
+      // pinned so it is visibly in today's list even when the budget is already spent
+      pinned: { day, ids: [...(s.pinned?.day === day ? s.pinned.ids : []), id] },
+    }));
+    setQa("");
+  };
   const createCustom = (once) => {
     const id = `custom:${Date.now()}`;
     setStamped((s) => ({
@@ -302,6 +448,47 @@ export default function DailyPicker({ initial, initialSync }) {
   const unhideLib = (t) => setStamped((s) => ({ ...s, hiddenLib: (s.hiddenLib || []).filter((x) => x !== t.id) }));
   const deleteCustom = (t) => setStamped((s) => { const c = { ...s.custom }; delete c[t.id]; const a = { ...s.active }; delete a[t.id]; return { ...s, custom: c, active: a, removed: { ...(s.removed || {}), [t.id]: day } }; });
   const reset = () => { if (window.confirm("Reset everything to the starter set?")) setStamped(seedState()); };
+
+  // apply Done taps made on the home-screen widget. Everything reads from the
+  // reducer's own state (never the render closure), is deduped, and is
+  // idempotent per day — so late or repeated drains can't double-count, and a
+  // drain during unmount/remount still applies (the queue was already cleared natively).
+  const applyWidgetDone = (rawIds) => {
+    const ids = [...new Set(rawIds)];
+    const dayNow = todayIndex();
+    const n = new Date(); const minute = n.getHours() * 60 + n.getMinutes();
+    const toCancel = [];
+    setStamped((s) => {
+      let next = s;
+      for (const id of ids) {
+        const rec = next.active?.[id]; if (!rec) continue;
+        const base = LIB_BY_ID[id] || next.custom?.[id];
+        const t = base ? { ...base, ...(next.overrides?.[id] || {}) } : null;
+        if (!t) continue;
+        if (!t.once && (rec.history || []).includes(dayNow)) continue;
+        const alarms = { ...(next.alarms || {}) };
+        if (alarms[id]) { toCancel.push(alarms[id].uuid); delete alarms[id]; }
+        const tl = { ...(next.tlog || {}) }; tl[id] = [...(tl[id] || []), [dayNow, minute]].slice(-40);
+        const pts = next.points + Math.max(5, Math.round(t.effort / 3));
+        if (t.once) {
+          const a = { ...next.active }; delete a[id];
+          const c = { ...next.custom }; delete c[id];
+          next = { ...next, active: a, custom: c, alarms, tlog: tl, removed: { ...(next.removed || {}), [id]: dayNow }, points: pts, doneOnce: [...(next.doneOnce || []), { name: t.name, day: dayNow, effort: t.effort }].slice(-50) };
+        } else {
+          next = { ...next, active: { ...next.active, [id]: { ...rec, lastDone: dayNow, history: [...(rec.history || []), dayNow] } }, alarms, tlog: tl, points: pts };
+        }
+      }
+      return next;
+    });
+    toCancel.forEach((u) => cancelTaskAlarm(u));
+  };
+  useEffect(() => {
+    if (!canWidget) return;
+    const drain = async () => { const ids = await pullPendingDone(); if (ids.length) applyWidgetDone(ids); };
+    drain();
+    document.addEventListener("visibilitychange", drain); window.addEventListener("focus", drain);
+    return () => { document.removeEventListener("visibilitychange", drain); window.removeEventListener("focus", drain); };
+  }, []);
 
   const level = Math.floor(points / 100) + 1;
   const openTask = open ? taskOf(open) : null;
@@ -334,10 +521,37 @@ export default function DailyPicker({ initial, initialSync }) {
                 <button style={{ ...S.linkBtn, marginLeft: 6 }} onClick={endHoliday}>I'm back</button>
               </div>
             )}
-            <button style={{ ...S.addBtn, marginBottom: 16 }} onClick={() => createCustom(true)}>+ Add a one-off</button>
+            {syncBroken && (
+              <div style={{ ...S.hiddenNote, marginBottom: 10, marginTop: 0 }}>Sync has stopped — the token was rejected. Make a new one and reconnect in ⚙.</div>
+            )}
+            <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+              <input style={{ ...S.search, marginBottom: 0, flex: 1 }} placeholder="Add a one-off, or search everything…" value={qa}
+                onChange={(e) => setQa(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && qa.trim()) { createOneOffNamed(qa.trim()); } }} />
+              <button style={S.addBtnSm} onClick={() => qa.trim() ? createOneOffNamed(qa.trim()) : createCustom(true)}>Add</button>
+            </div>
+            {qa.trim() && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ ...S.allRow, cursor: "pointer" }} onClick={() => createOneOffNamed(qa.trim())}>
+                  <div style={{ flex: 1 }}>New one-off “{qa.trim()}”<div style={S.meta}>added straight to today</div></div>
+                  <button style={S.addBtnSm}>Add</button>
+                </div>
+                {searchMatches.map(({ t, tracked }) => (
+                  <div key={t.id} style={S.allRow}>
+                    <div style={{ flex: 1, cursor: "pointer" }} onClick={() => setOpen(t.id)}>
+                      <div>{t.name}</div>
+                      <div style={S.meta}>{t.cat} · {t.effort} min{tracked ? " · tracking" : " · in library"}</div>
+                    </div>
+                    {tracked
+                      ? <button style={S.addBtnSm} onClick={() => { pin(t); setQa(""); }}>pin today</button>
+                      : <button style={S.addBtnSm} onClick={() => { add(t); pin(t); setQa(""); }}>add for today</button>}
+                  </div>
+                ))}
+              </div>
+            )}
             <div style={S.controls}>
               <div style={S.ctlRow}><span style={S.ctlLabel}>Time</span>
-                {[30, 60, 120, 240].map((m) => <Chip key={m} on={mins === m} onClick={() => setMins(m)}>{m < 60 ? `${m}m` : `${m / 60}h`}</Chip>)}
+                {[15, 30, 60, 120, 240].map((m) => <Chip key={m} on={mins === m} onClick={() => setMins(m)}>{m < 60 ? `${m}m` : `${m / 60}h`}</Chip>)}
               </div>
               <div style={S.ctlRow}><span style={S.ctlLabel}>Energy</span>
                 {[[1, "Low"], [2, "OK"], [3, "Good"]].map(([e, l]) => <Chip key={e} on={energy === e} onClick={() => setEnergy(e)}>{l}</Chip>)}
@@ -349,10 +563,19 @@ export default function DailyPicker({ initial, initialSync }) {
             </div>
 
             {picks.length === 0 ? (
-              <div style={S.empty}>{surfaced.length === 0 ? "Nothing left for today. Nice." : "Nothing fits that time and energy. Try more time, or call it a day."}</div>
+              surfaced.length === 0 ? (
+                <div style={S.empty}>Nothing left for today. Nice.</div>
+              ) : spentToday >= mins && !moreAnyway ? (
+                <div style={S.empty}>
+                  That’s your {mins < 60 ? `${mins} minutes` : `${mins / 60} hour${mins > 60 ? "s" : ""}`} done. Anything more is a bonus.
+                  <div style={{ marginTop: 10 }}><button style={S.addBtnSm} onClick={() => setMoreAnyway(true)}>show more anyway</button></div>
+                </div>
+              ) : (
+                <div style={S.empty}>Nothing fits that time and energy. Try more time, or call it a day.</div>
+              )
             ) : (
               <div>
-                <div style={S.sectionTitle}>Suggested — {picks.reduce((a, t) => a + t.effort, 0)} min</div>
+                <div style={S.sectionTitle}>Suggested — {picks.reduce((a, t) => a + t.effort, 0)} min{spentToday > 0 ? ` · ${spentToday} min done` : ""}</div>
                 {(byCat ? CATS.map((c) => [c, picks.filter((t) => t.cat === c)]).filter(([, r]) => r.length) : [[null, picks]]).map(([c, rows]) => (
                   <div key={c || "flat"}>
                     {c && <div style={S.catTitle}>{c}</div>}
@@ -379,8 +602,8 @@ export default function DailyPicker({ initial, initialSync }) {
                 ))}
               </details>
             )}
-            {Object.values(snoozed).filter((u) => u > day).length > 0 && (
-              <div style={S.hiddenNote}>{Object.values(snoozed).filter((u) => u > day).length} snoozed until next week · <button style={S.linkBtn} onClick={() => setStamped((s) => ({ ...s, snoozed: {} }))}>bring back</button></div>
+            {Object.values(snoozed).filter((v) => snUntil(v) > day).length > 0 && (
+              <div style={S.hiddenNote}>{Object.values(snoozed).filter((v) => snUntil(v) > day).length} snoozed until next week · <button style={S.linkBtn} onClick={() => setStamped((s) => ({ ...s, snoozed: Object.fromEntries(Object.keys(s.snoozed || {}).map((k) => [k, { until: 0, at: Date.now() }])) }))}>bring back</button></div>
             )}
             {hidden.length > 0 && (
               <div style={S.hiddenNote}>{hidden.length} waiting for another day — {hidden.slice(0, 3).map((t) => `${t.name} (${t.opps.map((d) => DAYS[d]).join("/")})`).join(", ")}{hidden.length > 3 ? "…" : ""}</div>
@@ -396,22 +619,23 @@ export default function DailyPicker({ initial, initialSync }) {
               <button style={S.addBtn} onClick={() => createCustom(false)}>+ Repeating task</button>
               <button style={S.addBtn} onClick={() => createCustom(true)}>+ One-off</button>
             </div>
-            {activeTasks.some((t) => t.once) && (<div><div style={S.sectionTitle}>One-offs</div>
-              {activeTasks.filter((t) => t.once).sort((a, b) => b.u - a.u).map((t) => (
+            <input style={{ ...S.search, marginTop: 10 }} placeholder="Search your tasks" value={mineFilter} onChange={(e) => setMineFilter(e.target.value)} />
+            {activeTasks.some((t) => t.once && mineMatch(t)) && (<div><div style={S.sectionTitle}>One-offs</div>
+              {activeTasks.filter((t) => t.once && mineMatch(t)).sort((a, b) => b.u - a.u).map((t) => (
                 <div key={t.id} style={S.allRow}><UrgencyDot u={t.u} />
                   <div style={{ flex: 1, cursor: "pointer" }} onClick={() => setOpen(t.id)}><div>{t.name || "(untitled)"}</div>
                     <div style={S.meta}>{t.effort} min{t.opps ? ` · ${t.opps.map((d) => DAYS[d]).join("/")}` : ""} · {urgencyWord(t.u)}</div></div>
                 </div>))}
             </div>)}
             {CATS.filter((c) => c !== "One-off").map((c) => {
-              const rows = activeTasks.filter((t) => t.cat === c && !t.once).sort((a, b) => b.u - a.u);
+              const rows = activeTasks.filter((t) => t.cat === c && !t.once && mineMatch(t)).sort((a, b) => b.u - a.u);
               if (!rows.length) return null;
               return (<div key={c}><div style={S.sectionTitle}>{c}</div>
                 {rows.map((t) => (
                   <div key={t.id} style={S.allRow}><UrgencyDot u={t.u} />
                     <div style={{ flex: 1, cursor: "pointer" }} onClick={() => setOpen(t.id)}>
                       <div>{t.name}</div>
-                      <div style={S.meta}>every ~{t.cadence}d{t.opps ? ` · ${t.opps.map((d) => DAYS[d]).join("/")}` : ""} · {urgencyWord(t.u)}{snoozed[t.id] > day ? " · snoozed" : ""} · done {active[t.id].history.length}×</div>
+                      <div style={S.meta}>every ~{t.cadence}d{t.opps ? ` · ${t.opps.map((d) => DAYS[d]).join("/")}` : ""} · {urgencyWord(t.u)}{snUntil(snoozed[t.id]) > day ? " · snoozed" : ""} · done {active[t.id].history.length}×</div>
                     </div>
                   </div>))}
               </div>);
@@ -465,6 +689,34 @@ export default function DailyPicker({ initial, initialSync }) {
               ) : (
                 <div style={S.empty}>{weekOffset ? "Nothing logged last week. That's allowed." : "Nothing yet this week — the week is young."}</div>
               )}
+              {(() => {
+                // ---- coach: what the app has quietly learned ----
+                const allLogs = Object.entries(st.tlog || {}).flatMap(([id, arr]) => arr.map(([d, m]) => ({ id, d, m })));
+                if (allLogs.length < 10) return null;
+                const lines = [];
+                const buckets = { morning: 0, afternoon: 0, evening: 0 };
+                allLogs.forEach(({ m }) => { buckets[m < 720 ? "morning" : m < 1020 ? "afternoon" : "evening"]++; });
+                const best = Object.entries(buckets).sort((x, y) => y[1] - x[1])[0];
+                if (best[1] / allLogs.length > 0.45) lines.push(`Most things get done in the ${best[0]} — that's your window.`);
+                const dow = Array(7).fill(0);
+                allLogs.forEach(({ d }) => dow[dateOf(d).getDay()]++);
+                const bestDow = dow.indexOf(Math.max(...dow));
+                if (Math.max(...dow) >= 5) lines.push(`${["Sundays", "Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays"][bestDow]} are when you get the most done.`);
+                const slipping = activeTasks.find((t) => t.keystone && !t.once && (uDay - (active[t.id]?.lastDone ?? uDay)) / t.cadence > 2);
+                if (slipping) lines.push(`★ “${slipping.name}” is non-negotiable and it's slipping — give it tomorrow's first slot.`);
+                const skipTotals = Object.entries(st.skiplog || {}).map(([id, arr]) => ({ id, n: arr.filter((d) => day - d <= 30).length })).sort((x, y) => y.n - x.n);
+                if (skipTotals[0]?.n >= 4) { const t = taskOf(skipTotals[0].id); if (t) lines.push(t.keystone ? `★ “${t.name}” is non-negotiable but keeps getting skipped — pin it or set an alarm.` : `“${t.name}” keeps getting a “not today” — open it for gentler options.`); }
+                const consistent = activeTasks.filter((t) => !t.once && (active[t.id]?.history || []).filter((d) => day - d <= 28).length >= Math.max(3, Math.floor(28 / t.cadence) * 0.8))
+                  .sort((x, y) => (active[y.id]?.history || []).length - (active[x.id]?.history || []).length)[0];
+                if (consistent) lines.push(`“${consistent.name}” has become a genuine habit — it basically runs itself now.`);
+                if (!lines.length) return null;
+                return (
+                  <div style={{ ...S.nudge, marginTop: 16 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 6 }}>What Today has noticed</div>
+                    {lines.slice(0, 3).map((l, i) => <div key={i} style={{ marginBottom: 4 }}>{l}</div>)}
+                  </div>
+                );
+              })()}
             </div>
           );
         })()}
@@ -475,8 +727,20 @@ export default function DailyPicker({ initial, initialSync }) {
             <div style={{ ...S.ctlRow, flexWrap: "wrap", marginBottom: 8 }}>
               {["All", ...CATS].map((c) => <Chip key={c} on={libCat === c} onClick={() => setLibCat(c)}>{c}</Chip>)}
             </div>
+            {libFilter.trim() && (() => {
+              const f = libFilter.trim().toLowerCase();
+              const trackedHits = activeTasks.filter((t) => !t.once && (t.name.toLowerCase().includes(f) || t.cat.toLowerCase().includes(f)));
+              if (!trackedHits.length) return null;
+              return (<div><div style={S.sectionTitle}>Already tracking ({trackedHits.length})</div>
+                {trackedHits.map((t) => (
+                  <div key={t.id} style={{ ...S.allRow, opacity: 0.75, cursor: "pointer" }} onClick={() => setOpen(t.id)}>
+                    <div style={{ flex: 1 }}>{t.name}<div style={S.meta}>{t.cat} · tap to edit</div></div>
+                  </div>))}
+              </div>);
+            })()}
             {CATS.filter((c) => c !== "One-off" && (libCat === "All" || libCat === c)).map((c) => {
-              const rows = allDefs.filter((t) => t.cat === c && !active[t.id] && !hiddenLib.includes(t.id) && !t.once && t.name.toLowerCase().includes(libFilter.toLowerCase()));
+              const f = libFilter.trim().toLowerCase();
+              const rows = allDefs.filter((t) => t.cat === c && !active[t.id] && !hiddenLib.includes(t.id) && !t.once && (t.name.toLowerCase().includes(f) || c.toLowerCase().includes(f)));
               if (!rows.length && libCat === "All") return null;
               return (<div key={c}><div style={{ ...S.sectionTitle, display: "flex", alignItems: "center" }}>{c}<span style={{ flex: 1 }} />
                   <button style={S.linkBtn} onClick={() => createLibTask(c)}>+ add</button>
@@ -595,15 +859,16 @@ export default function DailyPicker({ initial, initialSync }) {
           onAdd={() => add(openTask)} onRemove={() => { (openTask.once ? deleteCustom : remove)(openTask); setOpen(null); }} onDelete={openTask.id.startsWith("custom:") ? () => { deleteCustom(openTask); setOpen(null); } : null} cats={CATS} doneToday={doneToday.includes(openTask.id)}
           pinned={pinnedIds.includes(openTask.id)} onPin={() => { pin(openTask); setOpen(null); setTab("today"); }}
           onSkipWeek={() => { skipWeek(openTask); setOpen(null); }}
-          snoozedUntil={snoozed[openTask.id] > day ? snoozed[openTask.id] : null} onUnsnooze={() => unsnooze(openTask.id)}
-          alarm={st.alarms?.[openTask.id]} onSetAlarm={(tm) => setTaskAlarmFor(openTask, tm)} onClearAlarm={() => clearTaskAlarmFor(openTask)} />
+          snoozedUntil={snUntil(snoozed[openTask.id]) > day ? snUntil(snoozed[openTask.id]) : null} onUnsnooze={() => unsnooze(openTask.id)}
+          alarm={st.alarms?.[openTask.id]} onSetAlarm={(tm) => setTaskAlarmFor(openTask, tm)} onClearAlarm={() => clearTaskAlarmFor(openTask)}
+          slog={st.skiplog?.[openTask.id]} />
       )}
     </div>
   );
 }
 
 // ============ DETAIL SHEET ============
-function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemove, onDelete, doneToday, cats, pinned, onPin, onSkipWeek, snoozedUntil, onUnsnooze, alarm, onSetAlarm, onClearAlarm }) {
+function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemove, onDelete, doneToday, cats, pinned, onPin, onSkipWeek, snoozedUntil, onUnsnooze, alarm, onSetAlarm, onClearAlarm, slog }) {
   const [alarmTime, setAlarmTime] = useState("17:00");
   const hist = rec?.history || [];
   const gaps = hist.slice(1).map((d, i) => d - hist[i]);
@@ -616,6 +881,11 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
     <div style={S.sheetBg} onClick={onClose}>
       <div style={S.sheet} onClick={(e) => e.stopPropagation()}>
         <input style={S.nameInput} value={t.name} placeholder="What is it?" autoFocus={!t.name} onChange={(e) => onEdit({ name: e.target.value })} />
+        <textarea style={S.noteArea} rows={t.note ? Math.min(6, (t.note.match(/\n/g) || []).length + 2) : 1} placeholder="Notes — details, lists, links…"
+          value={t.note || ""} onChange={(e) => onEdit({ note: e.target.value })} />
+        {(t.note || "").match(/https?:\/\/\S+/g)?.map((u, i) => (
+          <div key={i} style={{ marginBottom: 4 }}><a href={u} target="_blank" rel="noreferrer" style={{ color: "#2F6F4E", fontSize: 13, wordBreak: "break-all" }}>{u}</a></div>
+        ))}
 
         <Field label="Repeats?">
           <div style={{ display: "flex", gap: 4 }}>
@@ -647,6 +917,12 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
         <Field label="Needs">
           <div style={{ display: "flex", gap: 4 }}>{[[1, "Low energy"], [2, "Some"], [3, "Real effort"]].map(([e, l]) => <Chip key={e} on={t.energy === e} onClick={() => onEdit({ energy: e })}>{l}</Chip>)}</div>
         </Field>
+        {!t.once && (<Field label="Matters">
+          <div style={{ display: "flex", gap: 4 }}>
+            <Chip on={!t.keystone} onClick={() => onEdit({ keystone: false })}>Normal</Chip>
+            <Chip on={!!t.keystone} onClick={() => onEdit({ keystone: true })}>★ Non-negotiable</Chip>
+          </div>
+        </Field>)}
         {isActive && canNotify && (
           <Field label="Alarm">
             {alarm ? (
@@ -677,8 +953,26 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
               <Stat n={`${t.cadence}d`} l="target" />
             </div>
             {avgGap && +avgGap > t.cadence * 1.5 && (
-              <div style={S.nudge}>You're doing this about every {avgGap} days, not {t.cadence}. Either that's fine — bump the target — or it wants a fixed slot.</div>
+              <div style={S.nudge}>You're doing this about every {avgGap} days, not {t.cadence}. Either that's fine — or make it official:{" "}
+                <button style={{ ...S.addBtnSm, marginLeft: 4 }} onClick={() => onEdit({ cadence: Math.max(1, Math.round(+avgGap)) })}>make it ~{Math.round(+avgGap)}d</button>
+              </div>
             )}
+            {(() => {
+              const skips = (slog || []).filter((d) => day - d <= 60).length;
+              const dones = hist.filter((d) => day - d <= 60).length;
+              if (t.keystone && skips >= 3 && skips > dones) return (
+                <div style={S.nudge}>★ This is non-negotiable, and it's slipping — {skips} skips lately. Give it the day's first slot, or a time it can't dodge.{" "}
+                  {onPin && <button style={{ ...S.addBtnSm, marginLeft: 4 }} onClick={onPin}>pin it today</button>}
+                </div>
+              );
+              if (!t.keystone && skips >= 5 && skips > 2 * dones) return (
+                <div style={S.nudge}>This one's been "not today" {skips} times lately. No guilt — but maybe it wants to be rarer, or let go.{" "}
+                  <button style={{ ...S.addBtnSm, marginLeft: 4 }} onClick={() => onEdit({ cadence: t.cadence * 2 })}>every ~{t.cadence * 2}d instead</button>{" "}
+                  <button style={S.linkBtn} onClick={onRemove}>stop tracking</button>
+                </div>
+              );
+              return null;
+            })()}
             {hist.length > 0 && (
               <details style={S.details}><summary style={S.summary}>All completions</summary>
                 <div style={S.meta}>{[...hist].reverse().map(fmt).join(" · ")}</div>
@@ -739,7 +1033,8 @@ function TaskRow({ t, onOpen, onDone, onSkip, onSkipWeek, onPin, pinned, muted }
     <div style={{ ...S.row, opacity: muted ? 0.75 : 1 }}>
       <UrgencyDot u={t.u} />
       <div style={{ flex: 1, cursor: "pointer" }} onClick={onOpen}>
-        <div>{t.name || "(untitled)"}</div><div style={S.meta}>{pinned ? "pinned · " : ""}{t.cat} · {t.effort} min · {urgencyWord(t.u)}</div>
+        <div>{t.keystone ? <span style={{ color: "#C9892A" }}>★ </span> : null}{t.name || "(untitled)"}{t.note ? " ✎" : ""}</div>
+        <div style={S.meta}>{pinned ? "pinned · " : ""}{t.cat} · {t.effort} min · {urgencyWord(t.u)}{t.fit >= 0.5 ? " · usually about now" : ""}</div>
       </div>
       {onPin && <button style={{ ...S.miniBtn, marginRight: 2 }} onClick={onPin}>{pinned ? "unpin" : "pin"}</button>}
       <div style={{ display: "flex", flexDirection: "column", alignItems: "stretch", gap: 6 }}>
@@ -803,6 +1098,7 @@ const S = {
   statRow: { display: "flex", gap: 8, marginTop: 12 },
   nudge: { fontSize: 13, background: "#EEF3EC", borderRadius: 10, padding: "10px 12px", marginTop: 12, lineHeight: 1.4 },
   catTitle: { fontSize: 12, opacity: 0.55, margin: "10px 0 0", fontWeight: 600 },
+  noteArea: { width: "100%", boxSizing: "border-box", border: "1px solid #D9E4D6", borderRadius: 10, background: "white", padding: "8px 10px", fontSize: 14, color: ink, fontFamily: "inherit", resize: "vertical", marginBottom: 8 },
   barTrack: { height: 5, background: "#D9E4D6", borderRadius: 3, marginTop: 3 },
   weekCell: { borderRadius: 8, padding: "10px 0", fontSize: 14, fontWeight: 600 },
 };
