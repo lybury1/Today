@@ -50,24 +50,22 @@ export const buildDigest = ({ st, day, weekStartDay, taskOf, activeTasks, dateOf
 
 const SYSTEM = `You write the weekly coach's note for "Today", a personal task app whose entire philosophy is: nothing is ever overdue, there are no streaks, and no guilt — ever. The user is Henry (UK English).
 
-You receive a JSON digest of his week. Write a note of 3–5 short sentences. Hard rules:
+You receive a JSON digest of his week. Write AT MOST 3 short sentences and AT MOST 55 words total — brevity is a hard requirement, not a style preference. One glance, not a read. Hard rules:
 - Only state things the digest supports. Never invent numbers or tasks.
 - NEVER use: "streak", "behind", "overdue", "failed", "only", "just" (as in "only 3"), "should have", or any comparison framed as decline or debt.
-- Celebrate what happened, name at most ONE gentle challenge, and it must concern a non-negotiable (★) task that is slipping — if none are slipping, no challenge at all.
+- Pick the ONE most interesting true thing and say it concretely (name the task or pattern); add at most ONE gentle challenge, and only about a non-negotiable (★) that is slipping.
 - Returning after a quiet spell is a win, never an apology.
-- Concrete beats generic: name real tasks and real patterns from the digest.
-- End on something true and kind. No sign-off, no emoji, no bullet points — flowing prose only.`;
+- No sign-off, no emoji, no bullet points, no preamble — start mid-thought if needed.`;
 
-// Returns the note text, or null on any failure (caller falls back to templates).
-export const generateCoachNote = async (apiKey, digest) => {
+const callClaude = async (apiKey, system, user) => {
   try {
     const client = new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
     const response = await client.messages.create({
       model: "claude-opus-5",
       max_tokens: 1024,
       output_config: { effort: "low" },
-      system: SYSTEM,
-      messages: [{ role: "user", content: "This week's digest:\n" + JSON.stringify(digest, null, 1) }],
+      system,
+      messages: [{ role: "user", content: user }],
     });
     if (response.stop_reason === "refusal") return null;
     const text = response.content.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
@@ -77,3 +75,16 @@ export const generateCoachNote = async (apiKey, digest) => {
     return null;
   }
 };
+
+// Returns the note text, or null on any failure (caller falls back to templates).
+export const generateCoachNote = (apiKey, digest) =>
+  callClaude(apiKey, SYSTEM, "This week's digest:\n" + JSON.stringify(digest, null, 1));
+
+const DAILY_SYSTEM = `You write ONE sentence (max 18 words) shown at the top of Henry's task app this morning. UK English.
+It must be grounded in the JSON given — reference a real task or pattern. Warm, specific, zero pressure.
+Banned: "streak", "behind", "overdue", "should", exclamation marks, emoji, generic motivation ("you've got this").
+Good shape: "Tuesday mornings are usually your reading slot — Read 20 pages is top of today's list." Output the sentence only.`;
+
+// One grounded sentence for the Today tab; null on failure (caller shows nothing).
+export const generateDailyLine = (apiKey, miniDigest) =>
+  callClaude(apiKey, DAILY_SYSTEM, "Today:\n" + JSON.stringify(miniDigest, null, 1));

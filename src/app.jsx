@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import { saveState, saveSync, clearSync } from "./storage.js";
 import { canNotify, setDailyReminder, setTaskAlarm, cancelTaskAlarm, setCheckIns } from "./notify.js";
 import { loadCoachKey, saveCoachKey, clearCoachKey } from "./storage.js";
-import { buildDigest, generateCoachNote } from "./coach.js";
+import { buildDigest, generateCoachNote, generateDailyLine } from "./coach.js";
 import { canWidget, pushWidgetData, pullPendingDone } from "./widget.js";
 
 // ============ LIBRARY (see tasks.js) ============
@@ -116,6 +116,7 @@ export default function DailyPicker({ initial, initialSync }) {
   const [byCat, setByCat] = useState(false);
   const [weekOffset, setWeekOffset] = useState(0);
   const [moreAnyway, setMoreAnyway] = useState(false); // "show more anyway" past today's budget
+  const [sitBase, setSitBase] = useState(0); // spentToday value when this sitting began
   const [coachKey, setCoachKey] = useState("");
   const [coachKeyInput, setCoachKeyInput] = useState("");
   const [coachBusy, setCoachBusy] = useState("");
@@ -298,6 +299,21 @@ export default function DailyPicker({ initial, initialSync }) {
     return near / logs.length;
   };
 
+  // the time chips mean "time I have in front of me RIGHT NOW" — a sitting.
+  // Completions during this sitting draw the budget down; a new sitting starts
+  // when a chip is tapped, the day rolls, or the app returns after a real break.
+  const sitSpent = Math.max(0, spentToday - sitBase);
+  // new sitting: at open / day rollover, and when the app returns after a real break
+  useEffect(() => { setSitBase(spentToday); setMoreAnyway(false); }, [day]);
+  const hiddenAtRef = React.useRef(0);
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === "hidden") hiddenAtRef.current = Date.now();
+      else if (hiddenAtRef.current && Date.now() - hiddenAtRef.current > 15 * 60 * 1000) { setSitBase((prev) => Math.max(prev, spentToday)); setMoreAnyway(false); }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [spentToday]);
   const picks = useMemo(() => {
     const pinnedTasks = surfaced.filter((t) => pinnedIds.includes(t.id));
     const rest = surfaced.filter((t) => !pinnedIds.includes(t.id)).map((t) => ({ ...t, fit: timeFit(t.id) }));
@@ -306,7 +322,7 @@ export default function DailyPicker({ initial, initialSync }) {
     const sorted = rest.filter((t) => !keystones.includes(t))
       .sort((a, b) => (b.u * (1 + 0.15 * b.fit)) - (a.u * (1 + 0.15 * a.fit)));
     const out = [...pinnedTasks];
-    const budget = moreAnyway ? mins : Math.max(0, mins - spentToday);
+    const budget = moreAnyway ? mins : Math.max(0, mins - sitSpent);
     let left = Math.max(0, budget - pinnedTasks.reduce((a, t) => a + t.effort, 0));
     for (const t of keystones) {
       if (out.length >= 8 || t.effort > left) continue;
@@ -318,7 +334,7 @@ export default function DailyPicker({ initial, initialSync }) {
       if (okEnergy && t.effort <= left) { out.push(t); left -= t.effort; }
     }
     return out;
-  }, [surfaced, mins, energy, pinnedIds, spentToday, moreAnyway, nowMin]);
+  }, [surfaced, mins, energy, pinnedIds, sitSpent, moreAnyway, nowMin]);
   const pickIds = new Set(picks.map((t) => t.id));
   const others = surfaced.filter((t) => !pickIds.has(t.id)).sort((a, b) => b.u - a.u);
 
@@ -455,6 +471,16 @@ export default function DailyPicker({ initial, initialSync }) {
   const deleteCustom = (t) => setStamped((s) => { const c = { ...s.custom }; delete c[t.id]; const a = { ...s.active }; delete a[t.id]; return { ...s, custom: c, active: a, removed: { ...(s.removed || {}), [t.id]: day } }; });
   const reset = () => { if (window.confirm("Reset everything to the starter set?")) setStamped(seedState()); };
 
+  // keep the check-in nudges naming the current top pick (native only, throttled by name)
+  const lastCheckInTopRef = React.useRef(null);
+  useEffect(() => {
+    if (!canNotify || !st.checkIns) return;
+    const top = picks[0]?.name || null;
+    if (top === lastCheckInTopRef.current) return;
+    lastCheckInTopRef.current = top;
+    setCheckIns(st.checkIns, top);
+  }, [picks, st.checkIns]);
+
   // apply Done taps made on the home-screen widget. Everything reads from the
   // reducer's own state (never the render closure), is deduped, and is
   // idempotent per day — so late or repeated drains can't double-count, and a
@@ -495,6 +521,30 @@ export default function DailyPicker({ initial, initialSync }) {
     document.addEventListener("visibilitychange", drain); window.addEventListener("focus", drain);
     return () => { document.removeEventListener("visibilitychange", drain); window.removeEventListener("focus", drain); };
   }, []);
+
+  // proactive coach: a one-line grounded nudge each morning, no button needed
+  const lineBusyRef = React.useRef(false);
+  useEffect(() => {
+    if (!coachKey || lineBusyRef.current || st.coachLine?.day === day || picks.length === 0) return;
+    lineBusyRef.current = true;
+    (async () => {
+      const mini = {
+        weekday: DAYS[weekday],
+        topPicks: picks.slice(0, 4).map((t) => ({ name: t.name, cat: t.cat, mins: t.effort, usuallyAboutNow: t.fit >= 0.5 })),
+        nonNegotiablesDue: activeTasks.filter((t) => t.keystone && t.u >= 1).map((t) => t.name),
+        doneYesterday: Object.values(active).reduce((a, r) => a + ((r.history || []).includes(day - 1) ? 1 : 0), 0),
+        productiveWindow: (() => { const b = { morning: 0, afternoon: 0, evening: 0 }; Object.values(st.tlog || {}).flat().forEach(([, m]) => b[m < 720 ? "morning" : m < 1020 ? "afternoon" : "evening"]++); return Object.entries(b).sort((x, y) => y[1] - x[1])[0][0]; })(),
+      };
+      const r = await generateDailyLine(coachKey, mini);
+      if (typeof r === "string") setStamped((s) => ({ ...s, coachLine: { day, text: r } }));
+      else if (!r || !r.badKey) setStamped((s) => ({ ...s, coachLine: { day, text: null } })); // don't retry all day on transient failure
+      lineBusyRef.current = false;
+    })();
+  }, [coachKey, day, picks.length]);
+  // auto-write the weekly note on Sundays (manual button still works any day)
+  useEffect(() => {
+    if (coachKey && weekday === 0 && st.coachNote?.week !== weekStart(day)) writeCoachNote();
+  }, [coachKey, day]);
 
   const writeCoachNote = async () => {
     if (!coachKey || coachBusy) return;
@@ -543,6 +593,9 @@ export default function DailyPicker({ initial, initialSync }) {
             {syncBroken && (
               <div style={{ ...S.hiddenNote, marginBottom: 10, marginTop: 0 }}>Sync has stopped — the token was rejected. Make a new one and reconnect in ⚙.</div>
             )}
+            {st.coachLine?.day === day && st.coachLine.text && (
+              <div style={{ fontSize: 13, fontStyle: "italic", color: ink, opacity: 0.65, margin: "0 0 12px", lineHeight: 1.4 }}>{st.coachLine.text}</div>
+            )}
             <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
               <input style={{ ...S.search, marginBottom: 0, flex: 1 }} placeholder="Add a one-off, or search everything…" value={qa}
                 onChange={(e) => setQa(e.target.value)}
@@ -570,7 +623,7 @@ export default function DailyPicker({ initial, initialSync }) {
             )}
             <div style={S.controls}>
               <div style={S.ctlRow}><span style={S.ctlLabel}>Time</span>
-                {[15, 30, 60, 120, 240].map((m) => <Chip key={m} on={mins === m} onClick={() => setMins(m)}>{m < 60 ? `${m}m` : `${m / 60}h`}</Chip>)}
+                {[15, 30, 60, 120, 240].map((m) => <Chip key={m} on={mins === m} onClick={() => { setMins(m); setSitBase(spentToday); setMoreAnyway(false); }}>{m < 60 ? `${m}m` : `${m / 60}h`}</Chip>)}
               </div>
               <div style={S.ctlRow}><span style={S.ctlLabel}>Energy</span>
                 {[[1, "Low"], [2, "OK"], [3, "Good"]].map(([e, l]) => <Chip key={e} on={energy === e} onClick={() => setEnergy(e)}>{l}</Chip>)}
@@ -584,7 +637,7 @@ export default function DailyPicker({ initial, initialSync }) {
             {picks.length === 0 ? (
               surfaced.length === 0 ? (
                 <div style={S.empty}>Nothing left for today. Nice.</div>
-              ) : spentToday >= mins && !moreAnyway ? (
+              ) : sitSpent >= mins && !moreAnyway ? (
                 <div style={S.empty}>
                   That’s your {mins < 60 ? `${mins} minutes` : `${mins / 60} hour${mins > 60 ? "s" : ""}`} done. Anything more is a bonus.
                   <div style={{ marginTop: 10 }}><button style={S.addBtnSm} onClick={() => setMoreAnyway(true)}>show more anyway</button></div>
@@ -594,7 +647,7 @@ export default function DailyPicker({ initial, initialSync }) {
               )
             ) : (
               <div>
-                <div style={S.sectionTitle}>Suggested — {picks.reduce((a, t) => a + t.effort, 0)} min{spentToday > 0 ? ` · ${spentToday} min done` : ""}</div>
+                <div style={S.sectionTitle}>Suggested — {picks.reduce((a, t) => a + t.effort, 0)} min{sitSpent > 0 ? ` · ${sitSpent} min this sitting` : ""}{spentToday > sitSpent ? ` · ${spentToday} min today` : spentToday > 0 && sitSpent === 0 ? ` · ${spentToday} min today` : ""}</div>
                 {(byCat ? CATS.map((c) => [c, picks.filter((t) => t.cat === c)]).filter(([, r]) => r.length) : [[null, picks]]).map(([c, rows]) => (
                   <div key={c || "flat"}>
                     {c && <div style={S.catTitle}>{c}</div>}

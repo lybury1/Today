@@ -48,18 +48,22 @@ export const cancelTaskAlarm = async (uuid) => {
 };
 
 // Gentle recurring check-in nudges through the day (notification ids 10+).
+// When a topTask name is given, the nudge names it — refreshed whenever picks change.
 const CHECKIN_HOURS = { 2: [10, 16], 3: [9, 13, 18], 5: [9, 12, 15, 18, 21] };
-export const setCheckIns = async (n) => {
+export const setCheckIns = async (n, topTask) => {
   if (!canNotify) return false;
   await LocalNotifications.cancel({ notifications: [10, 11, 12, 13, 14].map((id) => ({ id })) }).catch(() => {});
   if (!n) return true;
   const perm = await LocalNotifications.requestPermissions();
   if (perm.display !== "granted") return false;
+  const body = topTask
+    ? `“${topTask}” is top of the list, if a minute opens up.`
+    : "A spare minute? Something on the list might fit.";
   await LocalNotifications.schedule({
     notifications: (CHECKIN_HOURS[n] || []).map((h, i) => ({
       id: 10 + i,
       title: "Today",
-      body: "A spare minute? Something on the list might fit.",
+      body,
       schedule: { on: { hour: h, minute: 0 } },
     })),
   });
