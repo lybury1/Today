@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { saveState, saveSync, clearSync } from "./storage.js";
 import { canNotify, setDailyReminder } from "./notify.js";
+import { canWidget, pushWidgetData } from "./widget.js";
 
 // ============ LIBRARY (see tasks.js) ============
 const RAW = window.TASK_LIBRARY;
@@ -210,6 +211,12 @@ export default function DailyPicker({ initial, initialSync }) {
     return out;
   }, [surfaced, mins, energy, pinnedIds]);
   const others = surfaced.filter((t) => !picks.includes(t)).sort((a, b) => b.u - a.u);
+
+  // keep the home-screen widget in step with today's picks (native only)
+  useEffect(() => {
+    if (!canWidget) return;
+    pushWidgetData({ date: `${DAYS[weekday]} ${dateOf(day).getDate()} ${dateOf(day).toLocaleString("en-GB", { month: "long" })}`, items: picks.map((t) => ({ name: t.name || "(untitled)", cat: t.cat, effort: t.effort, u: urgencyWord(t.u) })) });
+  }, [picks, day]);
   const hidden = activeTasks.filter((t) => t.opps !== null && !t.opps.includes(weekday));
 
   // ---- actions ----
@@ -239,7 +246,11 @@ export default function DailyPicker({ initial, initialSync }) {
   const unsnooze = (id) => setStamped((s) => { const sn = { ...(s.snoozed || {}) }; delete sn[id]; return { ...s, snoozed: sn }; });
   const pin = (t) => setStamped((s) => { const ids = s.pinned?.day === day ? s.pinned.ids : [];
     return { ...s, pinned: { day, ids: ids.includes(t.id) ? ids.filter((x) => x !== t.id) : [...ids, t.id] } }; });
-  const setReminderTo = async (h) => { const ok = await setDailyReminder(h); if (ok) setStamped((s) => ({ ...s, reminder: h })); };
+  const setReminderTo = async (h, styleArg) => {
+    const style = styleArg ?? st.reminderStyle ?? "gentle";
+    const ok = await setDailyReminder(h, style);
+    if (ok) setStamped((s) => ({ ...s, reminder: h, reminderStyle: style }));
+  };
   const startHoliday = () => setStamped((s) => ({ ...s, holiday: { since: day } }));
   const endHoliday = () => setStamped((s) => {
     const gap = day - s.holiday.since; const a = {};
@@ -514,7 +525,14 @@ export default function DailyPicker({ initial, initialSync }) {
                   <Chip on={st.reminder == null} onClick={() => setReminderTo(null)}>Off</Chip>
                   {[8, 13, 18].map((h) => <Chip key={h} on={st.reminder === h} onClick={() => setReminderTo(h)}>{h}:00</Chip>)}
                 </div>
-                <div style={S.footnote}>One gentle nudge a day, nothing else. No badges, no nagging.</div>
+                {st.reminder != null && (
+                  <div style={{ ...S.ctlRow, marginTop: 8 }}>
+                    <span style={S.ctlLabel}>Style</span>
+                    <Chip on={(st.reminderStyle ?? "gentle") === "gentle"} onClick={() => setReminderTo(st.reminder, "gentle")}>Gentle</Chip>
+                    <Chip on={st.reminderStyle === "alarm"} onClick={() => setReminderTo(st.reminder, "alarm")}>Alarm</Chip>
+                  </div>
+                )}
+                <div style={S.footnote}>{st.reminderStyle === "alarm" ? "A full-screen alarm that cuts through Silent and Focus. For when gentle isn't working." : "One gentle nudge a day, nothing else. No badges, no nagging."}</div>
               </>
             )}
 

@@ -17,7 +17,12 @@ Vite build (Node lives at `~/.local/node/bin`, on PATH via `.zshrc`). `npm run d
 - `public/tasks.js` — the task library, `window.TASK_LIBRARY = { Category: [[name, cadence, opps, effort_mins, energy_1to3], …] }` and `window.STARTER_TASKS`. ~800 tasks. **Task id = `Category:Name`**, so renaming a task or moving it between categories resets its history for the user — avoid unless asked.
 - `public/sw.js` — offline cache, runtime (network-first) since bundle names are hashed. Bump `CACHE` to force a clean slate.
 - `public/manifest.json`, `public/icon-*.png` — PWA install.
-- `ios/` — Capacitor iOS shell (SPM, no CocoaPods). `npx cap sync ios` after every web build. App id `com.lybury1.today`. Needs full Xcode to build/run.
+- `ios/` — Capacitor iOS shell (SPM, no CocoaPods). App id `com.lybury1.today`. Needs full Xcode to build/run.
+  - After a web build, copy `dist/` into `ios/App/App/public/` (keep `cordova.js` + `cordova_plugins.js`). NOTE: `npx cap sync ios` hangs on this project's hand-wired pbxproj — do the copy manually.
+  - `App/WidgetBridge.swift` + `App/AlarmBridge.swift` — app-local Capacitor plugins, registered in `App/AppViewController.swift` (which `SceneDelegate` must instantiate — NOT plain `CAPBridgeViewController`, or the plugins silently vanish).
+  - `TodayWidget/` — WidgetKit extension (medium + large home-screen widget). Reads JSON the app writes to app group `group.com.lybury1.today` (key `widget-data`) via `src/widget.js` → WidgetBridge on every picks change. Both targets carry the app-group entitlement.
+  - `AlarmBridge` schedules a daily full-screen AlarmKit alarm (iOS 26+, same as Todoist urgent reminders) when reminder Style = Alarm; gentle style uses local notifications. State: `reminder` (hour), `reminderStyle` ("gentle" | "alarm").
+  - New Swift files must be added to the Xcode target via the `xcodeproj` ruby gem (see `ios/add_widget_target.rb` for the pattern) — nothing is auto-discovered.
 - `README.md` — user-facing setup notes.
 
 ## State
