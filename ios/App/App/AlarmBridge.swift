@@ -32,6 +32,8 @@ public class AlarmBridgePlugin: CAPPlugin, CAPBridgedPlugin {
         let hour = call.getInt("hour") ?? 8
         let minute = call.getInt("minute") ?? 0
         let testSeconds = call.getInt("testSeconds") ?? 0
+        let once = call.getBool("once") ?? false
+        let alarmId = call.getString("uuid").flatMap { UUID(uuidString: $0) } ?? Self.alarmID
         let title = call.getString("title") ?? "Time to pick your day"
         Task {
             do {
@@ -49,12 +51,12 @@ public class AlarmBridgePlugin: CAPPlugin, CAPBridgedPlugin {
                         attributes: attributes)
                 } else {
                     let time = Alarm.Schedule.Relative.Time(hour: hour, minute: minute)
-                    let schedule = Alarm.Schedule.relative(Alarm.Schedule.Relative(
-                        time: time,
-                        repeats: .weekly([.monday, .tuesday, .wednesday, .thursday, .friday, .saturday, .sunday])))
+                    let repeats: Alarm.Schedule.Relative.Recurrence = once ? .never
+                        : .weekly([.monday, .tuesday, .wednesday, .thursday, .friday, .saturday, .sunday])
+                    let schedule = Alarm.Schedule.relative(Alarm.Schedule.Relative(time: time, repeats: repeats))
                     config = AlarmManager.AlarmConfiguration(schedule: schedule, attributes: attributes)
                 }
-                _ = try await AlarmManager.shared.schedule(id: Self.alarmID, configuration: config)
+                _ = try await AlarmManager.shared.schedule(id: alarmId, configuration: config)
                 call.resolve(["ok": true])
             } catch {
                 call.resolve(["ok": false, "reason": error.localizedDescription])
@@ -68,7 +70,8 @@ public class AlarmBridgePlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func cancel(_ call: CAPPluginCall) {
         #if canImport(AlarmKit)
         if #available(iOS 26.0, *) {
-            try? AlarmManager.shared.cancel(id: Self.alarmID)
+            let alarmId = call.getString("uuid").flatMap { UUID(uuidString: $0) } ?? Self.alarmID
+            try? AlarmManager.shared.cancel(id: alarmId)
         }
         #endif
         call.resolve()

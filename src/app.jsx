@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from "react";
 import { saveState, saveSync, clearSync } from "./storage.js";
-import { canNotify, setDailyReminder } from "./notify.js";
+import { canNotify, setDailyReminder, setTaskAlarm, cancelTaskAlarm, setCheckIns } from "./notify.js";
 import { canWidget, pushWidgetData } from "./widget.js";
 
 // ============ LIBRARY (see tasks.js) ============
@@ -233,14 +233,16 @@ export default function DailyPicker({ initial, initialSync }) {
 
   // ---- actions ----
   const done = (t) => {
+    const priorAlarm = st.alarms?.[t.id]; if (priorAlarm) cancelTaskAlarm(priorAlarm.uuid);
     setStamped((s) => {
+      const alarms = { ...(s.alarms || {}) }; delete alarms[t.id];
       const pts = s.points + Math.max(5, Math.round(t.effort / 3)) + (t.u > 1.5 ? 5 : 0);
       if (t.once) {
         const a = { ...s.active }; delete a[t.id];
         const c = { ...s.custom }; delete c[t.id];
-        return { ...s, active: a, custom: c, removed: { ...(s.removed || {}), [t.id]: day }, points: pts, doneOnce: [...(s.doneOnce || []), { name: t.name, day }].slice(-50) };
+        return { ...s, active: a, custom: c, alarms, removed: { ...(s.removed || {}), [t.id]: day }, points: pts, doneOnce: [...(s.doneOnce || []), { name: t.name, day }].slice(-50) };
       }
-      return { ...s, active: { ...s.active, [t.id]: { ...s.active[t.id], lastDone: day, history: [...(s.active[t.id]?.history || []), day] } }, points: pts };
+      return { ...s, active: { ...s.active, [t.id]: { ...s.active[t.id], lastDone: day, history: [...(s.active[t.id]?.history || []), day] } }, alarms, points: pts };
     });
   };
   const undo = (t) => {
@@ -262,6 +264,18 @@ export default function DailyPicker({ initial, initialSync }) {
     const style = styleArg ?? st.reminderStyle ?? "gentle";
     const ok = await setDailyReminder(h, style);
     if (ok) setStamped((s) => ({ ...s, reminder: h, reminderStyle: style }));
+  };
+  const setCheckInsTo = async (n) => { const ok = await setCheckIns(n); if (ok) setStamped((s) => ({ ...s, checkIns: n })); };
+  const setTaskAlarmFor = async (t, timeStr) => {
+    const [h, m] = timeStr.split(":").map(Number);
+    const uuid = st.alarms?.[t.id]?.uuid || crypto.randomUUID();
+    const ok = await setTaskAlarm(uuid, h, m, t.name || "Task");
+    if (ok) setStamped((s) => ({ ...s, alarms: { ...(s.alarms || {}), [t.id]: { t: timeStr, uuid } } }));
+    return ok;
+  };
+  const clearTaskAlarmFor = (t) => {
+    const a = st.alarms?.[t.id]; if (a) cancelTaskAlarm(a.uuid);
+    setStamped((s) => { const al = { ...(s.alarms || {}) }; delete al[t.id]; return { ...s, alarms: al }; });
   };
   const startHoliday = () => setStamped((s) => ({ ...s, holiday: { since: day } }));
   const endHoliday = () => setStamped((s) => {
@@ -545,6 +559,13 @@ export default function DailyPicker({ initial, initialSync }) {
                   </div>
                 )}
                 <div style={S.footnote}>{st.reminderStyle === "alarm" ? "A full-screen alarm that cuts through Silent and Focus. For when gentle isn't working." : "One gentle nudge a day, nothing else. No badges, no nagging."}</div>
+
+                <div style={S.sectionTitle}>Check-ins</div>
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  <Chip on={!st.checkIns} onClick={() => setCheckInsTo(0)}>Off</Chip>
+                  {[2, 3, 5].map((n) => <Chip key={n} on={st.checkIns === n} onClick={() => setCheckInsTo(n)}>{n}× a day</Chip>)}
+                </div>
+                <div style={S.footnote}>Quiet nudges to glance at the list. 2× is 10:00 &amp; 16:00, 3× is 9:00 / 13:00 / 18:00, 5× is every ~3h from 9:00 to 21:00.</div>
               </>
             )}
 
@@ -574,14 +595,16 @@ export default function DailyPicker({ initial, initialSync }) {
           onAdd={() => add(openTask)} onRemove={() => { (openTask.once ? deleteCustom : remove)(openTask); setOpen(null); }} onDelete={openTask.id.startsWith("custom:") ? () => { deleteCustom(openTask); setOpen(null); } : null} cats={CATS} doneToday={doneToday.includes(openTask.id)}
           pinned={pinnedIds.includes(openTask.id)} onPin={() => { pin(openTask); setOpen(null); setTab("today"); }}
           onSkipWeek={() => { skipWeek(openTask); setOpen(null); }}
-          snoozedUntil={snoozed[openTask.id] > day ? snoozed[openTask.id] : null} onUnsnooze={() => unsnooze(openTask.id)} />
+          snoozedUntil={snoozed[openTask.id] > day ? snoozed[openTask.id] : null} onUnsnooze={() => unsnooze(openTask.id)}
+          alarm={st.alarms?.[openTask.id]} onSetAlarm={(tm) => setTaskAlarmFor(openTask, tm)} onClearAlarm={() => clearTaskAlarmFor(openTask)} />
       )}
     </div>
   );
 }
 
 // ============ DETAIL SHEET ============
-function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemove, onDelete, doneToday, cats, pinned, onPin, onSkipWeek, snoozedUntil, onUnsnooze }) {
+function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemove, onDelete, doneToday, cats, pinned, onPin, onSkipWeek, snoozedUntil, onUnsnooze, alarm, onSetAlarm, onClearAlarm }) {
+  const [alarmTime, setAlarmTime] = useState("17:00");
   const hist = rec?.history || [];
   const gaps = hist.slice(1).map((d, i) => d - hist[i]);
   const avgGap = gaps.length ? (gaps.reduce((a, b) => a + b, 0) / gaps.length).toFixed(1) : null;
@@ -624,6 +647,18 @@ function Detail({ t, rec, day, isActive, onClose, onEdit, onDone, onAdd, onRemov
         <Field label="Needs">
           <div style={{ display: "flex", gap: 4 }}>{[[1, "Low energy"], [2, "Some"], [3, "Real effort"]].map(([e, l]) => <Chip key={e} on={t.energy === e} onClick={() => onEdit({ energy: e })}>{l}</Chip>)}</div>
         </Field>
+        {isActive && canNotify && (
+          <Field label="Alarm">
+            {alarm ? (
+              <span style={{ fontSize: 14 }}>{alarm.t} today · full-screen <button style={S.linkBtn} onClick={onClearAlarm}>remove</button></span>
+            ) : (
+              <span style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input type="time" style={{ ...S.num, width: 110 }} value={alarmTime} onChange={(e) => setAlarmTime(e.target.value)} />
+                <button style={S.addBtnSm} onClick={() => alarmTime && onSetAlarm(alarmTime)}>Set for today</button>
+              </span>
+            )}
+          </Field>
+        )}
 
         {isActive && !t.once && (
           <div style={{ marginTop: 18 }}>
@@ -694,10 +729,10 @@ function TaskRow({ t, onOpen, onDone, onSkip, onSkipWeek, onPin, pinned, muted }
       <div style={{ flex: 1, cursor: "pointer" }} onClick={onOpen}>
         <div>{t.name || "(untitled)"}</div><div style={S.meta}>{pinned ? "pinned · " : ""}{t.cat} · {t.effort} min · {urgencyWord(t.u)}</div>
       </div>
-      {onPin && <button style={S.linkBtn} onClick={onPin}>{pinned ? "unpin" : "pin"}</button>}
-      <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
-        <button style={S.linkBtn} onClick={onSkip}>not today</button>
-        {onSkipWeek && <button style={S.linkBtn} onClick={onSkipWeek}>not this wk</button>}
+      {onPin && <button style={{ ...S.miniBtn, marginRight: 2 }} onClick={onPin}>{pinned ? "unpin" : "pin"}</button>}
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "stretch", gap: 6 }}>
+        <button style={S.miniBtn} onClick={onSkip}>not today</button>
+        {onSkipWeek && <button style={S.miniBtn} onClick={onSkipWeek}>not this wk</button>}
       </div>
       <button style={S.doneBtn} onClick={onDone}>Done</button>
     </div>
@@ -734,10 +769,11 @@ const S = {
   allRow: { display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid #E3EAE0", fontSize: 14 },
   meta: { fontSize: 12, opacity: 0.55, marginTop: 2 },
   dot: { width: 12, height: 12, borderRadius: 6, flexShrink: 0 },
-  doneBtn: { background: moss, color: "white", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 13, cursor: "pointer" },
+  doneBtn: { background: moss, color: "white", border: "none", borderRadius: 8, padding: "10px 14px", fontSize: 13, cursor: "pointer" },
   addBtn: { background: "white", border: `1px solid ${moss}`, color: moss, borderRadius: 8, padding: "8px 14px", fontSize: 13, cursor: "pointer", width: "100%", marginTop: 4 },
   addBtnSm: { background: "white", border: `1px solid ${moss}`, color: moss, borderRadius: 8, padding: "5px 12px", fontSize: 13, cursor: "pointer" },
-  linkBtn: { background: "none", border: "none", color: ink, opacity: 0.5, fontSize: 12, cursor: "pointer" },
+  linkBtn: { background: "none", border: "none", color: ink, opacity: 0.5, fontSize: 12, cursor: "pointer", padding: "6px 8px" },
+  miniBtn: { background: "white", border: "1px solid #C9D6C5", color: ink, borderRadius: 999, fontSize: 12, cursor: "pointer", padding: "7px 11px", whiteSpace: "nowrap" },
   details: { marginTop: 10 },
   summary: { fontSize: 13, opacity: 0.7, cursor: "pointer", padding: "6px 0" },
   hiddenNote: { fontSize: 12, opacity: 0.55, marginTop: 14, lineHeight: 1.4 },
